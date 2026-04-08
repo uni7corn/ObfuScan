@@ -809,6 +809,11 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
     r.so_name = name;
     r.file_size = input_buf.size();
 
+
+    if (name.find("assets/") != std::string::npos) {
+        r.reasons.push_back("从assets目录加载，可能使用了某种加固");
+    }
+
     std::vector<uint8_t> work_buf = input_buf;
 
     if (is_zip_magic(work_buf)) {
@@ -1228,7 +1233,7 @@ static std::vector<ApkSoEntry> load_arm64_sos_from_apk(const std::string &apk_pa
         if (st.m_is_directory) continue;
 
         std::string name = st.m_filename ? st.m_filename : "";
-        if (!starts_with(name, "lib/arm64-v8a/")) continue;
+        if (!starts_with(name, "lib/arm64-v8a/") && !starts_with(name, "assets/")) continue;
         if (!ends_with(name, ".so")) continue;
 
         size_t out_size = 0;
