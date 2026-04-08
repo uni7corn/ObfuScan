@@ -1,0 +1,3 @@
+[submodule "LibChecker-Rules"]
+	path = LibChecker-Rules
+	url = https://github.com/LibChecker/LibChecker-Rules.git

@@ -309,7 +309,8 @@ ObfuScan **不适合**拿来做这些事情：
 - **GPT**
 - **Capstone**
 - **miniz**
-
+- **LibChecker-Rules**
+ 
 ---
 
 ## English
@@ -378,6 +379,24 @@ In a nutshell:
 
 2. **View Output**
    The command line will output analysis results in JSON format
+
+---
+
+### Build Environment
+
+Recommended build environment:
+
+- **CLion 2025.3.1**
+- **CMake 3.20+**
+- **C++17 compatible compiler**
+
+Build steps:
+
+1. Open the project in CLion
+2. Wait for CMake to automatically configure
+3. Select Release configuration
+4. Click the build button
+5. After build completion, the executable will be generated in the corresponding build directory
 
 ---
 
@@ -602,3 +621,4 @@ Thanks to the following projects / tools:
 - **GPT**
 - **Capstone**
 - **miniz**
+- **LibChecker-Rules**
