@@ -19,11 +19,13 @@ OBFUSCAN_EXECUTABLE = os.path.join(os.path.dirname(__file__), 'ObfuScan.exe')
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 LIBCHECKER_RULES_DIR = os.path.join(CURRENT_DIR, 'LibChecker-Rules')
 
+
 class LibCheckerMatcher:
     """LibChecker 规则匹配器"""
+
     def __init__(self, rules_dir):
         self.rules_dir = rules_dir
-        self.rules =[]
+        self.rules = []
         self.load_rules()
 
     def load_rules(self):
@@ -42,7 +44,7 @@ class LibCheckerMatcher:
 
                         # 初始化一个扁平化的规则字典
                         parsed_rule = {
-                            '_filename': filename[:-5], # e.g. libImSDK.so
+                            '_filename': filename[:-5],  # e.g. libImSDK.so
                             'name': raw_rule.get('name'),
                             'isRegex': raw_rule.get('isRegex', False),
                             'label': '',
@@ -83,7 +85,7 @@ class LibCheckerMatcher:
         if not self.rules:
             return None
 
-        basename = os.path.basename(so_path) # 例如从 lib/arm64-v8a/libImSDK.so 拿到 libImSDK.so
+        basename = os.path.basename(so_path)  # 例如从 lib/arm64-v8a/libImSDK.so 拿到 libImSDK.so
 
         for rule in self.rules:
             is_regex = rule['isRegex']
@@ -99,6 +101,7 @@ class LibCheckerMatcher:
                 if basename == rule_name or basename == rule['_filename']:
                     return rule
         return None
+
 
 # 全局初始化匹配器
 MATCHER = LibCheckerMatcher(LIBCHECKER_RULES_DIR)
@@ -128,12 +131,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             apk_file = form['apk']
+            lang = form.getvalue('lang', 'zh')
+
             with tempfile.NamedTemporaryFile(suffix='.apk', delete=False) as temp_file:
                 temp_file.write(apk_file.file.read())
                 temp_apk_path = temp_file.name
 
             try:
-                result = self.run_obfuscan(temp_apk_path)
+                result = self.run_obfuscan(temp_apk_path, lang)
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json; charset=utf-8')
                 self.end_headers()
@@ -144,12 +149,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def run_obfuscan(self, apk_path):
+    def run_obfuscan(self, apk_path, lang='zh'):
         try:
             if not os.path.exists(OBFUSCAN_EXECUTABLE):
                 return {'error': True, 'message': f'ObfuScan.exe不存在。请先构建项目。'}
 
-            result = subprocess.run([OBFUSCAN_EXECUTABLE, apk_path],
+            cmd = [OBFUSCAN_EXECUTABLE, apk_path]
+            if lang == 'en':
+                cmd.append('--en')
+
+            result = subprocess.run(cmd,
                                     capture_output=True, text=True, encoding='utf-8'
                                     )
 
@@ -159,18 +168,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 analysis_result = json.loads(result.stdout)
 
-                # 核心：注入匹配规则
-                if '结果' in analysis_result:
-                    for item in analysis_result['结果']:
-                        so_path = item.get('so文件', '')
-                        if so_path:
-                            match_rule = MATCHER.match(so_path)
-                            if match_rule:
-                                item['LibChecker'] = {
-                                    '名称': match_rule['label'] or match_rule['_filename'],
-                                    '团队': match_rule['team'],
-                                    '描述': match_rule['description']
-                                }
+                if lang == 'zh':
+                    if '结果' in analysis_result:
+                        for item in analysis_result['结果']:
+                            so_path = item.get('so文件', '')
+                            if so_path:
+                                match_rule = MATCHER.match(so_path)
+                                if match_rule:
+                                    item['LibChecker'] = {
+                                        '名称': match_rule['label'] or match_rule['_filename'],
+                                        '团队': match_rule['team'],
+                                        '描述': match_rule['description']
+                                    }
+                else:
+                    if 'results' in analysis_result:
+                        for item in analysis_result['results']:
+                            so_path = item.get('so_file', '')
+                            if so_path:
+                                match_rule = MATCHER.match(so_path)
+                                if match_rule:
+                                    item['libchecker'] = {
+                                        'name': match_rule['label'] or match_rule['_filename'],
+                                        'team': match_rule['team'],
+                                        'description': match_rule['description']
+                                    }
 
                 return {'error': False, 'result': analysis_result}
             except json.JSONDecodeError as e:
@@ -192,6 +213,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
         header { background: #35424a; color: #ffffff; padding: 20px; margin-bottom: 20px; border-radius: 5px; }
         h1 { font-size: 28px; margin-bottom: 10px; }
+        .lang-switch { float: right; margin-top: -40px; }
+        .lang-btn { background: rgba(255,255,255,0.2); color: white; padding: 6px 12px; border: 1px solid rgba(255,255,255,0.3); border-radius: 4px; cursor: pointer; font-size: 14px; margin-left: 5px; }
+        .lang-btn:hover { background: rgba(255,255,255,0.3); }
+        .lang-btn.active { background: rgba(255,255,255,0.3); }
         .upload-section, .results-section { background: #ffffff; padding: 20px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
@@ -237,39 +262,140 @@ class RequestHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <header>
-            <h1>ObfuScan - APK分析工具</h1>
-            <p>快速分析Android APK中的Native SO文件，检测混淆、加壳等保护措施</p>
+            <h1 id="title">ObfuScan - APK分析工具</h1>
+            <p id="subtitle">快速分析Android APK中的Native SO文件，检测混淆、加壳等保护措施</p>
+            <div class="lang-switch">
+                <button id="langZh" class="lang-btn active" onclick="switchLang('zh')">中文</button>
+                <button id="langEn" class="lang-btn" onclick="switchLang('en')">English</button>
+            </div>
         </header>
         
         <div class="upload-section">
-            <h2>上传APK文件</h2>
+            <h2 id="uploadTitle">上传APK文件</h2>
             <form class="upload-form" id="uploadForm" enctype="multipart/form-data">
                 <div class="form-group">
-                    <label for="apkFile">选择APK文件：</label>
+                    <label for="apkFile" id="selectFileLabel">选择APK文件：</label>
                     <input type="file" id="apkFile" name="apk" accept=".apk">
                 </div>
-                <button type="submit">开始分析</button>
+                <button type="submit" id="analyzeBtn">开始分析</button>
             </form>
             <div class="loading" id="loading">
-                <p>正在分析并匹配组件指纹...请稍候</p>
+                <p id="loadingText">正在分析并匹配组件指纹...请稍候</p>
             </div>
         </div>
         
         <div class="results-section" id="resultsSection">
-            <h2>分析结果</h2>
+            <h2 id="resultsTitle">分析结果</h2>
             <div class="summary" id="summary"></div>
             <div id="resultList"></div>
         </div>
     </div>
     
     <script>
+        const lang = {
+            zh: {
+                title: 'ObfuScan - APK分析工具',
+                subtitle: '快速分析Android APK中的Native SO文件，检测混淆、加壳等保护措施',
+                uploadTitle: '上传APK文件',
+                selectFileLabel: '选择APK文件：',
+                analyzeBtn: '开始分析',
+                loadingText: '正在分析并匹配组件指纹...请稍候',
+                resultsTitle: '分析结果',
+                summary: '汇总信息',
+                totalSo: '总SO数量',
+                highRisk: '高风险',
+                mediumRisk: '中风险',
+                lowRisk: '低风险',
+                knownComponent: '💡 已知组件',
+                detectionResult: '检测结果',
+                description: '说明',
+                suspiciousPoints: '可疑点',
+                entryPreview: '入口预览',
+                name: '名称',
+                address: '地址',
+                preview: '预览',
+                vmpJudgment: 'VMP判断',
+                vmpScore: 'VMP分数',
+                vmpFeatures: 'VMP特征',
+                suggestion: '建议',
+                selectApk: '请选择APK文件',
+                error: '异常',
+                high: '高',
+                medium: '中',
+                low: '低'
+            },
+            en: {
+                title: 'ObfuScan - APK Analyzer',
+                subtitle: 'Quickly analyze Native SO files in Android APK, detect obfuscation and packing',
+                uploadTitle: 'Upload APK File',
+                selectFileLabel: 'Select APK File:',
+                analyzeBtn: 'Start Analysis',
+                loadingText: 'Analyzing and matching component fingerprints... Please wait',
+                resultsTitle: 'Analysis Results',
+                summary: 'Summary',
+                totalSo: 'Total SO Count',
+                highRisk: 'High Risk',
+                mediumRisk: 'Medium Risk',
+                lowRisk: 'Low Risk',
+                knownComponent: '💡 Known Component',
+                detectionResult: 'Detection Result',
+                description: 'Description',
+                suspiciousPoints: 'Suspicious Points',
+                entryPreview: 'Entry Previews',
+                name: 'Name',
+                address: 'Address',
+                preview: 'Preview',
+                vmpJudgment: 'VMP Judgment',
+                vmpScore: 'VMP Score',
+                vmpFeatures: 'VMP Features',
+                suggestion: 'Suggestion',
+                selectApk: 'Please select an APK file',
+                error: 'Error',
+                high: 'High',
+                medium: 'Medium',
+                low: 'Low'
+            }
+        };
+        
+        let currentLang = 'zh';
+        
+   function switchLang(language) {
+    currentLang = language;
+    document.getElementById('langZh').classList.toggle('active', language === 'zh');
+    document.getElementById('langEn').classList.toggle('active', language === 'en');
+
+    const t = lang[language];
+    document.getElementById('title').textContent = t.title;
+    document.getElementById('subtitle').textContent = t.subtitle;
+    document.getElementById('uploadTitle').textContent = t.uploadTitle;
+    document.getElementById('selectFileLabel').textContent = t.selectFileLabel;
+    document.getElementById('analyzeBtn').textContent = t.analyzeBtn;
+    document.getElementById('loadingText').textContent = t.loadingText;
+    document.getElementById('resultsTitle').textContent = t.resultsTitle;
+
+    if (lastResult) {
+        document.getElementById('summary').innerHTML =
+            '<div class="error-message">' +
+            (language === 'en'
+                ? 'Language changed. Please run analysis again.'
+                : '语言已切换，请重新分析。') +
+            '</div>';
+        document.getElementById('resultList').innerHTML = '';
+        lastResult = null;
+    }
+}
+        
+        let lastResult = null;
+        
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
             e.preventDefault();
             
             const formData = new FormData(this);
+            formData.append('lang', currentLang);
             const apkFile = document.getElementById('apkFile').files[0];
+            const t = lang[currentLang];
             
-            if (!apkFile) { alert('请选择APK文件'); return; }
+            if (!apkFile) { alert(t.selectApk); return; }
             
             document.getElementById('loading').style.display = 'block';
             document.getElementById('resultsSection').style.display = 'none';
@@ -283,83 +409,90 @@ class RequestHandler(BaseHTTPRequestHandler):
                     document.getElementById('summary').innerHTML = '<div class="error-message">' + data.message + '</div>';
                     document.getElementById('resultList').innerHTML = '';
                 } else {
+                    lastResult = data.result;
                     displayResults(data.result);
                 }
             })
             .catch(err => {
                 document.getElementById('loading').style.display = 'none';
                 document.getElementById('resultsSection').style.display = 'block';
-                document.getElementById('summary').innerHTML = '<div class="error-message">异常: ' + err.message + '</div>';
+                document.getElementById('summary').innerHTML = '<div class="error-message">' + t.error + ': ' + err.message + '</div>';
                 document.getElementById('resultList').innerHTML = '';
             });
         });
         
         function displayResults(result) {
             document.getElementById('resultsSection').style.display = 'block';
+            const t = lang[currentLang];
             
-            const summary = result['汇总'];
-            let summaryHtml = '<h3>汇总信息</h3>';
-            summaryHtml += '<div class="summary-item"><span class="detail-label">总SO数量:</span> ' + summary['总so数量'] + '</div>';
-            summaryHtml += '<div class="summary-item"><span class="detail-label">高风险:</span> ' + summary['高风险'] + '</div>';
+            const summary = result['汇总'] || result['summary'];
+            let summaryHtml = '<h3>' + t.summary + '</h3>';
+            summaryHtml += '<div class="summary-item"><span class="detail-label">' + t.totalSo + ':</span> ' + (summary['总so数量'] || summary['total_so_count'] || 0) + '</div>';
+            summaryHtml += '<div class="summary-item"><span class="detail-label">' + t.highRisk + ':</span> ' + (summary['高风险'] || summary['high_risk'] || 0) + '</div>';
+            summaryHtml += '<div class="summary-item"><span class="detail-label">' + t.mediumRisk + ':</span> ' + (summary['中风险'] || summary['medium_risk'] || 0) + '</div>';
+            summaryHtml += '<div class="summary-item"><span class="detail-label">' + t.lowRisk + ':</span> ' + (summary['低风险'] || summary['low_risk'] || 0) + '</div>';
             document.getElementById('summary').innerHTML = summaryHtml;
             
-            const results = result['结果'];
+            const results = result['结果'] || result['results'];
             let resultsHtml = '';
             
             results.forEach(item => {
-                const riskLevel = item['风险等级'];
-                let riskClass = riskLevel === '高' ? 'high' : (riskLevel === '中' ? 'medium' : 'low');
+                const riskLevel = item['风险等级'] || item['risk_level'];
+                let riskClass = riskLevel === '高' || riskLevel === 'High' ? 'high' : (riskLevel === '中' || riskLevel === 'Medium' ? 'medium' : 'low');
+                let displayRisk = riskLevel === '高' ? t.high : (riskLevel === '中' ? t.medium : (riskLevel === '低' ? t.low : riskLevel));
                 
                 resultsHtml += '<div class="result-item ' + riskClass + '">';
                 resultsHtml += '<div class="result-header">';
-                resultsHtml += '<span class="so-name">' + item['so文件'] + '</span>';
-                resultsHtml += '<span class="risk-level ' + riskClass + '">' + riskLevel + '</span>';
+                resultsHtml += '<span class="so-name">' + (item['so文件'] || item['so_file']) + '</span>';
+                resultsHtml += '<span class="risk-level ' + riskClass + '">' + displayRisk + '</span>';
                 resultsHtml += '</div>';
                 resultsHtml += '<div class="result-details">';
                 
-                // === 这里是新加的 LibChecker 组件渲染逻辑 ===
-                if (item['LibChecker']) {
-                    const lc = item['LibChecker'];
+                if (item['LibChecker'] || item['libchecker']) {
+                    const lc = item['LibChecker'] || item['libchecker'];
                     resultsHtml += '<div class="libchecker-info">';
-                    resultsHtml += '<span class="detail-label">💡 已知组件:</span> ';
-                    resultsHtml += '<strong class="libchecker-name">' + lc['名称'] + '</strong>';
-                    if (lc['团队']) {
-                        resultsHtml += '<span class="libchecker-team">(' + lc['团队'] + ')</span>';
+                    resultsHtml += '<span class="detail-label">' + t.knownComponent + ':</span> ';
+                    resultsHtml += '<strong class="libchecker-name">' + (lc['名称'] || lc['name'] || '') + '</strong>';
+                    if (lc['团队'] || lc['team']) {
+                        resultsHtml += '<span class="libchecker-team">(' + (lc['团队'] || lc['team']) + ')</span>';
                     }
-                    if (lc['描述']) {
-                        resultsHtml += '<div class="libchecker-desc">' + lc['描述'] + '</div>';
+                    if (lc['描述'] || lc['description']) {
+                        resultsHtml += '<div class="libchecker-desc">' + (lc['描述'] || lc['description']) + '</div>';
                     }
                     resultsHtml += '</div>';
                 }
                 
-                resultsHtml += '<div class="detail-item"><span class="detail-label">检测结果:</span> ' + item['检测结果'] + '</div>';
-                resultsHtml += '<div class="detail-item"><span class="detail-label">说明:</span> ' + item['说明'] + '</div>';
+                resultsHtml += '<div class="detail-item"><span class="detail-label">' + t.detectionResult + ':</span> ' + (item['检测结果'] || item['detection_result'] || '') + '</div>';
+                resultsHtml += '<div class="detail-item"><span class="detail-label">' + t.description + ':</span> ' + (item['说明'] || item['description'] || '') + '</div>';
                 
-                if (item['可疑点'] && item['可疑点'].length > 0) {
-                    resultsHtml += '<div class="suspicious-points"><span class="detail-label">可疑点:</span><ul>';
-                    item['可疑点'].forEach(point => { resultsHtml += '<li>' + point + '</li>'; });
+                const suspiciousPoints = item['可疑点'] || item['suspicious_points'] || [];
+                if (suspiciousPoints.length > 0) {
+                    resultsHtml += '<div class="suspicious-points"><span class="detail-label">' + t.suspiciousPoints + ':</span><ul>';
+                    suspiciousPoints.forEach(point => { resultsHtml += '<li>' + point + '</li>'; });
                     resultsHtml += '</ul></div>';
                 }
                 
-                if (item['入口预览'] && item['入口预览'].length > 0) {
-                    resultsHtml += '<div class="entry-previews"><span class="detail-label">入口预览:</span>';
-                    item['入口预览'].forEach(entry => {
-                        resultsHtml += '<div class="entry-preview"><strong>' + entry['名称'] + '</strong> (地址: ' + entry['地址'] + ')<br>预览: ' + entry['预览'] + '</div>';
+                const entryPreviews = item['入口预览'] || item['entry_previews'] || [];
+                if (entryPreviews.length > 0) {
+                    resultsHtml += '<div class="entry-previews"><span class="detail-label">' + t.entryPreview + ':</span>';
+                    entryPreviews.forEach(entry => {
+                        resultsHtml += '<div class="entry-preview"><strong>' + (entry['名称'] || entry['name']) + '</strong> (' + t.address + ': ' + (entry['地址'] || entry['address']) + ')<br>' + t.preview + ': ' + (entry['预览'] || entry['preview']) + '</div>';
                     });
                     resultsHtml += '</div>';
                 }
                 
-                if (item['VMP判断']) {
-                    resultsHtml += '<div class="vmp-info"><span class="detail-label">VMP判断:</span> ' + item['VMP判断'] + '<br><span class="detail-label">VMP分数:</span> ' + item['VMP分数'] + '<br>';
-                    if (item['VMP特征']) {
-                        resultsHtml += '<span class="detail-label">VMP特征:</span><ul>';
-                        item['VMP特征'].forEach(f => { resultsHtml += '<li>' + f + '</li>'; });
+                if (item['VMP判断'] || item['vmp_judgment']) {
+                    resultsHtml += '<div class="vmp-info"><span class="detail-label">' + t.vmpJudgment + ':</span> ' + (item['VMP判断'] || item['vmp_judgment']) + '<br><span class="detail-label">' + t.vmpScore + ':</span> ' + (item['VMP分数'] || item['vmp_score']) + '<br>';
+                    const vmpFeatures = item['VMP特征'] || item['vmp_features'] || [];
+                    if (vmpFeatures.length > 0) {
+                        resultsHtml += '<span class="detail-label">' + t.vmpFeatures + ':</span><ul>';
+                        vmpFeatures.forEach(f => { resultsHtml += '<li>' + f + '</li>'; });
                         resultsHtml += '</ul>';
                     }
                     resultsHtml += '</div>';
                 }
                 
-                resultsHtml += '<div class="detail-item" style="margin-top:10px;"><span class="detail-label">建议:</span> ' + item['建议'] + '</div>';
+                resultsHtml += '<div class="detail-item" style="margin-top:10px;"><span class="detail-label">' + t.suggestion + ':</span> ' + (item['建议'] || item['suggestion'] || '') + '</div>';
                 resultsHtml += '</div></div>';
             });
             document.getElementById('resultList').innerHTML = resultsHtml;
@@ -369,6 +502,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 </html>
 '''
 
+
 def run_server():
     server = HTTPServer((HOST, PORT), RequestHandler)
     print(f"\n[OK] 服务器运行在 http://{HOST}:{PORT}")
@@ -376,6 +510,7 @@ def run_server():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == '__main__':
     run_server()

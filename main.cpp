@@ -1258,10 +1258,13 @@ static std::vector<ApkSoEntry> load_arm64_sos_from_apk(const std::string &apk_pa
 // =========================
 
 static void print_usage(const char *prog) {
-    std::cout << "用法:\n";
-    std::cout << "  " << prog << " <apk_path>\n\n";
-    std::cout << "示例:\n";
+    std::cout << "Usage:\n";
+    std::cout << "  " << prog << " <apk_path> [--en]\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  --en    Output in English\n\n";
+    std::cout << "Examples:\n";
     std::cout << "  " << prog << " demo.apk\n";
+    std::cout << "  " << prog << " demo.apk --en\n";
 }
 
 static std::string label_to_zh(const std::string &label) {
@@ -1276,10 +1279,28 @@ static std::string label_to_zh(const std::string &label) {
     return "未知";
 }
 
+static std::string label_to_en(const std::string &label) {
+    if (label == "POSSIBLE_PACKER") return "Possible Packer";
+    if (label == "POSSIBLE_OLLVM_OR_STRONG_OBF") return "Possible OLLVM/Strong Obfuscation";
+    if (label == "STRONG_OBFUSCATION") return "Strong Obfuscation";
+    if (label == "POSSIBLE_OLLVM") return "Possible OLLVM";
+    if (label == "NORMAL_OR_LIGHT_OBF") return "Normal or Light Obfuscation";
+    if (label == "INVALID_ELF") return "Invalid ELF Header";
+    if (label == "UNSUPPORTED_OR_NOT_AARCH64") return "Not a 64-bit ARM SO";
+    if (label == "ZIP_SO_CONTAINER") return "ZIP Container";
+    return "Unknown";
+}
+
 static std::string risk_level_zh(const AnalysisResult &r) {
     if (r.packer_score >= 0.70 || r.strong_obf_score >= 0.72) return "高";
     if (r.ollvm_score >= 0.50 || r.strong_obf_score >= 0.50) return "中";
     return "低";
+}
+
+static std::string risk_level_en(const AnalysisResult &r) {
+    if (r.packer_score >= 0.70 || r.strong_obf_score >= 0.72) return "High";
+    if (r.ollvm_score >= 0.50 || r.strong_obf_score >= 0.50) return "Medium";
+    return "Low";
 }
 
 static std::string reason_to_zh(const std::string &reason) {
@@ -1299,6 +1320,26 @@ static std::string reason_to_zh(const std::string &reason) {
         return "存在较多可疑加载器导入函数";
     }
     if (reason == "possible vmp dispatcher/handler loop") return "存在疑似VMP分发器/handler循环";
+    return reason;
+}
+
+static std::string reason_to_en(const std::string &reason) {
+    if (reason == "missing .symtab / stripped") return "Symbol table stripped";
+    if (reason == "found RWX PT_LOAD segment") return "Found RWX PT_LOAD segment";
+    if (reason == "large high-entropy blob detected") return "Large high-entropy blob detected";
+    if (reason == "tiny .text but large file") return "Small .text but large file";
+    if (reason == "very low printable string density") return "Very low printable string density";
+    if (reason == "high executable segment entropy") return "High executable segment entropy";
+    if (reason == "high branch density in AArch64 text") return "High branch density";
+    if (reason == "high indirect branch density") return "High indirect branch density";
+    if (reason == "high arithmetic/logical opcode density") return "High arithmetic/logical opcode density";
+    if (reason == "so entry is actually a zip container") return "SO entry is actually a ZIP container";
+    if (reason == "capstone init failed") return "Capstone initialization failed";
+
+    if (reason.rfind("suspicious loader imports hit=", 0) == 0) {
+        return "Suspicious loader imports";
+    }
+    if (reason == "possible vmp dispatcher/handler loop") return "Possible VMP dispatcher/handler loop";
     return reason;
 }
 
@@ -1336,6 +1377,40 @@ static std::string build_summary_zh(const AnalysisResult &r) {
     return "该 so 已完成静态特征分析。";
 }
 
+static std::string build_summary_en(const AnalysisResult &r) {
+    if (r.final_label == "ZIP_SO_CONTAINER") {
+        return "This SO entry is not a raw ELF but a ZIP container. The actual native library may be inside or released at runtime.";
+    }
+    if (r.is_zip_container && r.inner_elf_found && r.final_label == "NORMAL_OR_LIGHT_OBF") {
+        return "This SO is a ZIP container in APK. Inner ELF extracted and analyzed. Appears to be normal or lightly obfuscated.";
+    }
+    if (r.is_zip_container && r.inner_elf_found) {
+        return "This SO is a ZIP container in APK. Inner ELF extracted and analyzed. Inner sample shows significant protection or obfuscation.";
+    }
+    if (r.final_label == "POSSIBLE_PACKER") {
+        return "This SO shows obvious packer or loader characteristics, likely processed with decryption loading or entry protection.";
+    }
+    if (r.final_label == "POSSIBLE_OLLVM_OR_STRONG_OBF") {
+        return "This SO shows significant obfuscation characteristics, possibly using OLLVM, control flow flattening or other strong protections.";
+    }
+    if (r.final_label == "STRONG_OBFUSCATION") {
+        return "This SO shows obvious obfuscation traces, but the specific protection type cannot be confirmed by static features alone.";
+    }
+    if (r.final_label == "POSSIBLE_OLLVM") {
+        return "This SO shows anomalies in control flow and instruction distribution, possibly using OLLVM-style obfuscation.";
+    }
+    if (r.final_label == "NORMAL_OR_LIGHT_OBF") {
+        return "This SO appears to be a normal release or lightly obfuscated. No strong packer or heavy protection detected.";
+    }
+    if (r.final_label == "INVALID_ELF") {
+        return "File header is not a valid ELF.";
+    }
+    if (r.final_label == "UNSUPPORTED_OR_NOT_AARCH64") {
+        return "Not a 64-bit ARM SO.";
+    }
+    return "Static feature analysis completed.";
+}
+
 static std::string build_advice_zh(const AnalysisResult &r) {
     if (r.vmp.possible) {
         return "建议重点查看入口函数、dispatcher循环、handler表、字节码数据区及间接跳转链路。";
@@ -1353,6 +1428,25 @@ static std::string build_advice_zh(const AnalysisResult &r) {
         return "建议继续分析内层资源或运行时释放出来的真实 so。";
     }
     return "可暂不作为高优先级样本，必要时再人工复查。";
+}
+
+static std::string build_advice_en(const AnalysisResult &r) {
+    if (r.vmp.possible) {
+        return "Recommended: focus on entry functions, dispatcher loops, handler tables, bytecode data sections and indirect jump chains.";
+    }
+    if (r.final_label == "POSSIBLE_PACKER") {
+        return "Recommended: manually inspect init_array, JNI_OnLoad, and mprotect/mmap/dlopen related logic.";
+    }
+    if (r.final_label == "POSSIBLE_OLLVM_OR_STRONG_OBF" || r.final_label == "POSSIBLE_OLLVM") {
+        return "Recommended: use disassembly and CFG to confirm control flow flattening, opaque predicates or instruction substitution.";
+    }
+    if (r.final_label == "STRONG_OBFUSCATION") {
+        return "Recommended: further inspect entry functions, key exports and suspicious high-entropy regions.";
+    }
+    if (r.final_label == "ZIP_SO_CONTAINER") {
+        return "Recommended: analyze inner resources or the actual SO released at runtime.";
+    }
+    return "May deprioritize this sample. Manual review if necessary.";
 }
 
 static std::string join_preview_lines(const std::vector<DisasmLine>& lines, size_t max_lines = 3) {
@@ -1377,7 +1471,25 @@ struct SummaryStats {
     int inner_elf_extracted = 0;
 };
 
-static SummaryStats build_summary_stats(const std::vector<AnalysisResult> &results) {
+static std::string vmp_signal_to_en(const std::string &signal) {
+    if (signal == "重复出现高置信度取字节码-推进VIP-br分发窗口") return "Repeated high-confidence bytecode fetch-advance VIP-br dispatch window";
+    if (signal == "出现多处高置信度取字节码-br分发窗口") return "Multiple high-confidence bytecode fetch-br dispatch windows";
+    if (signal == "同一VIP寄存器重复出现") return "Same VIP register repeated";
+    if (signal == "疑似VIP寄存器重复出现") return "Possible VIP register repeated";
+    if (signal == "同一br目标寄存器重复作为分发出口") return "Same br target register repeated as dispatch exit";
+    if (signal == "疑似固定分发寄存器") return "Possible fixed dispatch register";
+    if (signal == "br分发指令数量偏高") return "High br dispatch instruction count";
+    if (signal == "存在一定数量的br分发指令") return "Some br dispatch instructions present";
+    if (signal == "中等置信度解释器窗口较多") return "Multiple medium-confidence interpreter windows";
+    if (signal == "存在较大高熵疑似字节码/handler数据区") return "Large high-entropy bytecode/handler data section";
+    if (signal == "字节/半字读取比例偏高") return "High byte/half-word load ratio";
+    if (signal == "位运算/比较密度偏高") return "High bitwise operation/compare density";
+    if (signal == "导入较少且存在早期初始化入口") return "Few imports with early initialization entries";
+    if (signal == "blr占优，更像虚表/函数指针调用") return "BLR dominant, more like vtable/function pointer calls";
+    return signal;
+}
+
+static SummaryStats build_summary_stats_zh(const std::vector<AnalysisResult> &results) {
     SummaryStats s;
     s.total = static_cast<int>(results.size());
 
@@ -1393,13 +1505,29 @@ static SummaryStats build_summary_stats(const std::vector<AnalysisResult> &resul
     return s;
 }
 
+static SummaryStats build_summary_stats_en(const std::vector<AnalysisResult> &results) {
+    SummaryStats s;
+    s.total = static_cast<int>(results.size());
+
+    for (const auto &r : results) {
+        std::string level = risk_level_en(r);
+        if (level == "High") s.high++;
+        else if (level == "Medium") s.medium++;
+        else s.low++;
+
+        if (r.is_zip_container) s.zip_so_container++;
+        if (r.inner_elf_found) s.inner_elf_extracted++;
+    }
+    return s;
+}
+
 static void print_all_results_json_cn(const std::vector<AnalysisResult> &results, bool pretty = true) {
     const char *indent1 = pretty ? "  " : "";
     const char *indent2 = pretty ? "    " : "";
     const char *indent3 = pretty ? "      " : "";
     const char *nl = pretty ? "\n" : "";
 
-    SummaryStats stats = build_summary_stats(results);
+    SummaryStats stats = build_summary_stats_zh(results);
 
     std::cout << "{" << nl;
 
@@ -1483,6 +1611,96 @@ static void print_all_results_json_cn(const std::vector<AnalysisResult> &results
     std::cout << "}" << nl;
 }
 
+static void print_all_results_json_en(const std::vector<AnalysisResult> &results, bool pretty = true) {
+    const char *indent1 = pretty ? "  " : "";
+    const char *indent2 = pretty ? "    " : "";
+    const char *indent3 = pretty ? "      " : "";
+    const char *nl = pretty ? "\n" : "";
+
+    SummaryStats stats = build_summary_stats_en(results);
+
+    std::cout << "{" << nl;
+
+    std::cout << indent1 << "\"summary\": {" << nl;
+    std::cout << indent2 << "\"total_so_count\": " << stats.total << "," << nl;
+    std::cout << indent2 << "\"high_risk\": " << stats.high << "," << nl;
+    std::cout << indent2 << "\"medium_risk\": " << stats.medium << "," << nl;
+    std::cout << indent2 << "\"low_risk\": " << stats.low << "," << nl;
+    std::cout << indent2 << "\"zip_container_count\": " << stats.zip_so_container << "," << nl;
+    std::cout << indent2 << "\"inner_elf_extracted_count\": " << stats.inner_elf_extracted << nl;
+    std::cout << indent1 << "}," << nl;
+
+    std::cout << indent1 << "\"results\": [" << nl;
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto &r = results[i];
+        std::vector<std::string> en_reasons;
+        for (const auto &reason : r.reasons) {
+            en_reasons.push_back(reason_to_en(reason));
+        }
+
+        std::cout << indent2 << "{" << nl;
+        std::cout << indent3 << "\"so_file\": \"" << json_escape(r.so_name) << "\"," << nl;
+        std::cout << indent3 << "\"detection_result\": \"" << json_escape(label_to_en(r.final_label)) << "\"," << nl;
+        std::cout << indent3 << "\"risk_level\": \"" << json_escape(risk_level_en(r)) << "\"," << nl;
+        std::cout << indent3 << "\"description\": \"" << json_escape(build_summary_en(r)) << "\"," << nl;
+
+        if (r.is_zip_container) {
+            std::cout << indent3 << "\"container_feature\": \"ZIP container\"," << nl;
+        }
+
+        std::cout << indent3 << "\"suspicious_points\": [" << nl;
+        for (size_t j = 0; j < en_reasons.size(); ++j) {
+            std::cout << indent3 << "  \"" << json_escape(en_reasons[j]) << "\"";
+            if (j + 1 != en_reasons.size()) std::cout << ",";
+            std::cout << nl;
+        }
+        std::cout << indent3 << "]," << nl;
+
+        if (!r.entry_previews.empty() && risk_level_en(r) == "High") {
+            std::cout << indent3 << "\"entry_previews\": [" << nl;
+            size_t limit = std::min<size_t>(r.entry_previews.size(), 4);
+            for (size_t k = 0; k < limit; ++k) {
+                const auto& ep = r.entry_previews[k];
+                std::cout << indent3 << "  {" << nl;
+                std::cout << indent3 << "    \"name\": \"" << json_escape(ep.name) << "\"," << nl;
+                std::cout << indent3 << "    \"address\": \"0x" << std::hex << ep.va << std::dec << "\"," << nl;
+                std::cout << indent3 << "    \"preview\": \"" << json_escape(join_preview_lines(ep.lines, 3)) << "\"" << nl;
+                std::cout << indent3 << "  }";
+                if (k + 1 != limit) std::cout << ",";
+                std::cout << nl;
+            }
+            std::cout << indent3 << "]," << nl;
+        }
+
+        if (r.vmp.analyzed && risk_level_en(r) == "High") {
+            std::cout << indent3 << "\"vmp_judgment\": \""
+                      << json_escape(r.vmp.possible ? "Possible VMP protection" : "No obvious VMP features")
+                      << "\"," << nl;
+
+            std::cout << indent3 << "\"vmp_score\": "
+                      << std::fixed << std::setprecision(4) << r.vmp.score << "," << nl;
+
+            if (r.vmp.possible) {
+                std::cout << indent3 << "\"vmp_features\": [" << nl;
+                for (size_t t = 0; t < r.vmp.signals.size(); ++t) {
+                    std::cout << indent3 << "  \"" << json_escape(vmp_signal_to_en(r.vmp.signals[t])) << "\"";
+                    if (t + 1 != r.vmp.signals.size()) std::cout << ",";
+                    std::cout << nl;
+                }
+                std::cout << indent3 << "]," << nl;
+            }
+        }
+
+        std::cout << indent3 << "\"suggestion\": \"" << json_escape(build_advice_en(r)) << "\"" << nl;
+        std::cout << indent2 << "}";
+
+        if (i + 1 != results.size()) std::cout << ",";
+        std::cout << nl;
+    }
+    std::cout << indent1 << "]" << nl;
+    std::cout << "}" << nl;
+}
+
 // =========================
 // 排序
 // =========================
@@ -1491,6 +1709,13 @@ static int risk_rank(const AnalysisResult& r) {
     std::string level = risk_level_zh(r);
     if (level == "高") return 3;
     if (level == "中") return 2;
+    return 1;
+}
+
+static int risk_rank_en(const AnalysisResult& r) {
+    std::string level = risk_level_en(r);
+    if (level == "High") return 3;
+    if (level == "Medium") return 2;
     return 1;
 }
 
@@ -1525,20 +1750,29 @@ int main(int argc, char *argv[]) {
     init_console_utf8();
 
     std::string apk_path;
-    if (argc >= 2) {
-        apk_path = argv[1];
-    } else {
+    bool output_en = false;
 
-     //     apk_path = "D:\\QQ.apk";
-     //    apk_path ="D:\\dyjs.apk";
-    //      apk_path ="D:\\tb.apk";
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--en") {
+            output_en = true;
+        } else if (arg.find("-") != 0) {
+            apk_path = arg;
+        }
+    }
 
-
+    if (apk_path.empty()) {
+        print_usage(argv[0]);
+        return 1;
     }
 
     auto sos = load_arm64_sos_from_apk(apk_path);
     if (sos.empty()) {
-        std::cerr << "[-] 没找到 lib/arm64-v8a/*.so\n";
+        if (output_en) {
+            std::cerr << "[-] No lib/arm64-v8a/*.so found\n";
+        } else {
+            std::cerr << "[-] 没找到 lib/arm64-v8a/*.so\n";
+        }
         return 2;
     }
 
@@ -1550,6 +1784,11 @@ int main(int argc, char *argv[]) {
     }
 
     sort_results_by_risk(results);
-    print_all_results_json_cn(results, true);
+    
+    if (output_en) {
+        print_all_results_json_en(results, true);
+    } else {
+        print_all_results_json_cn(results, true);
+    }
     return 0;
 }
