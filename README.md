@@ -32,11 +32,9 @@ python web_server.py
 
 #### Web 服务配置与上线边界
 
-常用默认值是 `127.0.0.1:8080`、请求体上限 `512 MiB`（APK 需为 multipart 边界留出少量空间）、扫描超时 `900s`、32 个连接、2 个扫描槽、临时盘保留 `512 MiB`、stdout/stderr `32/1 MiB`。可通过同名 `OBFUSCAN_*` 环境变量覆盖；`OBFUSCAN_EXECUTABLE` 指定引擎，公网环境应设置 `OBFUSCAN_EXPOSE_ENGINE_PATH=0` 且把扫描并发降为 `1`。完整配置见部署文档或 `web_server.py` 顶部。
+常用默认值是 `127.0.0.1:8080`、请求体上限 `512 MiB`（APK 需为 multipart 边界留出少量空间）、扫描超时 `900s`、32 个连接、2 个扫描槽、临时盘保留 `512 MiB`、stdout/stderr `32/1 MiB`。可通过同名 `OBFUSCAN_*` 环境变量覆盖；`OBFUSCAN_EXECUTABLE` 指定引擎，公网环境应设置 `OBFUSCAN_EXPOSE_ENGINE_PATH=0` 且把扫描并发降为 `1`。完整配置见 `web_server.py` 顶部。
 
 内置服务器已经具备有界多线程、连接空闲超时、并发扫描上限、Windows 独占端口、上传/临时盘/输出限制和基础安全响应头；但它**不提供 TLS、用户系统、验证码、账号配额或 DDoS 防护，不能直接绑定 `0.0.0.0` 裸露公网**。
-
-Codex 任务和 GitHub 仓库都不是长期网站服务器，GitHub Pages 也不能执行 Python 后端或 `ObfuScan` 原生程序。线上运行需要自有 VPS/云主机，并用 HTTPS 反向代理、鉴权、WAF/限流和低权限扫描账户保护。Windows VPS 模板与上线前验收门槛见 [`deploy/windows/DEPLOYMENT.md`](deploy/windows/DEPLOYMENT.md)；模板本身不代表已经上线。
 
 #### 方法二：命令行
 
@@ -283,11 +281,9 @@ Open http://127.0.0.1:8080, confirm that the analysis engine is ready, and drop 
 
 #### Web Configuration and Deployment Boundary
 
-Common defaults are `127.0.0.1:8080`, a `512 MiB` request-body limit (the APK must leave a little room for multipart framing), a `900s` scan timeout, 32 connections, 2 scan slots, `512 MiB` disk reserve, and `32/1 MiB` stdout/stderr limits. Override them with the corresponding `OBFUSCAN_*` variables; `OBFUSCAN_EXECUTABLE` selects the engine. Public deployments should set `OBFUSCAN_EXPOSE_ENGINE_PATH=0` and reduce scan concurrency to `1`. See the deployment guide or the top of `web_server.py` for the complete list.
+Common defaults are `127.0.0.1:8080`, a `512 MiB` request-body limit (the APK must leave a little room for multipart framing), a `900s` scan timeout, 32 connections, 2 scan slots, `512 MiB` disk reserve, and `32/1 MiB` stdout/stderr limits. Override them with the corresponding `OBFUSCAN_*` variables; `OBFUSCAN_EXECUTABLE` selects the engine. Public deployments should set `OBFUSCAN_EXPOSE_ENGINE_PATH=0` and reduce scan concurrency to `1`. See the top of `web_server.py` for the complete list.
 
 The built-in server has bounded threading, idle timeouts, scan concurrency limits, exclusive Windows port binding, upload/disk/output limits, and baseline security headers. It still **does not provide TLS, user accounts, CAPTCHA, quotas, or DDoS protection; do not bind it directly to `0.0.0.0` on the public Internet**.
-
-Neither a Codex task nor a GitHub repository is a persistent Web server, and GitHub Pages cannot execute the Python backend or native `ObfuScan` process. Public use requires your own VPS/cloud host behind HTTPS, authentication, WAF/rate limits, and a low-privilege scanner account. See [`deploy/windows/DEPLOYMENT.md`](deploy/windows/DEPLOYMENT.md) for the Windows VPS template and pre-launch gates; the template is not proof that a site has been deployed.
 
 #### Method 2: Command Line
 
