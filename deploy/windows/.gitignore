@@ -1,0 +1,5 @@
+obfuscan.config.psd1
+caddy.env.ps1
+Caddyfile
+logs/
+runtime/

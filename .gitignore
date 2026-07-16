@@ -1,0 +1,20 @@
+# IDE and Python caches
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+
+# Local build trees and generated CMake state
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Testing/
+
+# Local APK corpora are hash-pinned external fixtures, not repository assets
+*.apk
+
+# Local scan output and service logs
+*.log
+result*.json

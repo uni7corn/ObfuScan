@@ -8,18 +8,30 @@
 #include <unordered_map>
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <fstream>
 #include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <cctype>
+#include <filesystem>
+#include <new>
+#include <utility>
 
 #include "miniz.h"
+#include "apk_scan_limits.h"
 #include "disasm_arm64.h"
+#include "elf_dynamic.h"
+#include "vmp_detector.h"
+#include "vmp_linkage.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 // =========================
@@ -37,8 +49,10 @@ static constexpr uint32_t PF_R_VAL = 0x4;
 
 static constexpr uint32_t SHT_SYMTAB_VAL = 2;
 static constexpr uint32_t SHT_DYNSYM_VAL = 11;
+static constexpr uint64_t SHF_EXECINSTR_VAL = 0x4;
 
 static constexpr uint64_t SHN_UNDEF_VAL = 0;
+static constexpr uint8_t STT_FUNC_VAL = 2;
 
 #pragma pack(push, 1)
 struct Elf64_Ehdr_L {
@@ -172,29 +186,9 @@ static size_t count_printable_strings(const std::vector<uint8_t> &buf, size_t mi
     return count;
 }
 
-static std::vector<std::string> extract_printable_strings(const std::vector<uint8_t> &buf,
-                                                          size_t min_len = 4,
-                                                          size_t max_count = 5000) {
-    std::vector<std::string> out;
-    size_t i = 0;
-    while (i < buf.size() && out.size() < max_count) {
-        size_t j = i;
-        while (j < buf.size()) {
-            unsigned char c = buf[j];
-            if (c >= 0x20 && c <= 0x7e) ++j;
-            else break;
-        }
-        if (j - i >= min_len) {
-            out.emplace_back(reinterpret_cast<const char *>(&buf[i]), j - i);
-        }
-        i = (j == i) ? (i + 1) : (j + 1);
-    }
-    return out;
-}
-
 template<typename T>
 static bool read_struct(const std::vector<uint8_t> &buf, size_t offset, T &out) {
-    if (offset + sizeof(T) > buf.size()) return false;
+    if (offset > buf.size() || sizeof(T) > buf.size() - offset) return false;
     std::memcpy(&out, buf.data() + offset, sizeof(T));
     return true;
 }
@@ -229,16 +223,187 @@ static bool contains_any_icase(const std::vector<std::string> &hay, const std::v
     return false;
 }
 
-static bool contains_string_icase(const std::vector<std::string> &hay, const std::string &needle) {
-    std::string n = needle;
-    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+static bool valid_file_range(uint64_t offset, uint64_t size, size_t file_size) {
+    return offset <= file_size && size <= static_cast<uint64_t>(file_size) - offset;
+}
 
-    for (const auto &s : hay) {
-        std::string ls = s;
-        std::transform(ls.begin(), ls.end(), ls.begin(), [](unsigned char c){ return (char)std::tolower(c); });
-        if (ls.find(n) != std::string::npos) return true;
+struct ScanDiagnostic {
+    std::string severity;
+    std::string code;
+    std::string entry;
+    std::string detail;
+    uint64_t entry_index = 0;
+    uint64_t compressed_bytes = 0;
+    uint64_t uncompressed_bytes = 0;
+    bool has_entry_index = false;
+};
+
+static void record_scan_diagnostic(std::vector<ScanDiagnostic>& diagnostics,
+                                   uint64_t& suppressed_count,
+                                   ScanDiagnostic diagnostic) {
+    if (diagnostics.size() < obfuscan::ApkScanLimits::kMaxRecordedDiagnostics) {
+        diagnostics.push_back(std::move(diagnostic));
+    } else {
+        ++suppressed_count;
     }
-    return false;
+}
+
+struct MinizAllocationBudget {
+    size_t limit_bytes = 0;
+    size_t current_bytes = 0;
+    size_t peak_bytes = 0;
+    bool limit_hit = false;
+};
+
+struct alignas(std::max_align_t) BoundedAllocationHeader {
+    size_t payload_bytes = 0;
+};
+
+static bool checked_allocation_size(size_t items, size_t size, size_t& out) {
+    if (items != 0 && size > std::numeric_limits<size_t>::max() / items) return false;
+    out = items * size;
+    if (out == 0) out = 1;
+    return out <= std::numeric_limits<size_t>::max() - sizeof(BoundedAllocationHeader);
+}
+
+static void* bounded_miniz_alloc(void* opaque, size_t items, size_t size) {
+    auto* budget = static_cast<MinizAllocationBudget*>(opaque);
+    size_t requested = 0;
+    if (!budget || !checked_allocation_size(items, size, requested) ||
+        requested > budget->limit_bytes - std::min(budget->current_bytes, budget->limit_bytes)) {
+        if (budget) budget->limit_hit = true;
+        return nullptr;
+    }
+
+    auto* header = static_cast<BoundedAllocationHeader*>(
+        std::malloc(sizeof(BoundedAllocationHeader) + requested));
+    if (!header) return nullptr;
+    header->payload_bytes = requested;
+    budget->current_bytes += requested;
+    budget->peak_bytes = std::max(budget->peak_bytes, budget->current_bytes);
+    return header + 1;
+}
+
+static void bounded_miniz_free(void* opaque, void* address) {
+    if (!address) return;
+    auto* budget = static_cast<MinizAllocationBudget*>(opaque);
+    auto* header = static_cast<BoundedAllocationHeader*>(address) - 1;
+    if (budget) {
+        budget->current_bytes = header->payload_bytes <= budget->current_bytes
+            ? budget->current_bytes - header->payload_bytes
+            : 0;
+    }
+    std::free(header);
+}
+
+static void* bounded_miniz_realloc(void* opaque, void* address,
+                                   size_t items, size_t size) {
+    if (!address) return bounded_miniz_alloc(opaque, items, size);
+
+    auto* budget = static_cast<MinizAllocationBudget*>(opaque);
+    auto* old_header = static_cast<BoundedAllocationHeader*>(address) - 1;
+    const size_t old_size = old_header->payload_bytes;
+    size_t requested = 0;
+    if (!budget || !checked_allocation_size(items, size, requested)) {
+        if (budget) budget->limit_hit = true;
+        return nullptr;
+    }
+
+    const size_t base = old_size <= budget->current_bytes
+        ? budget->current_bytes - old_size
+        : 0;
+    if (requested > budget->limit_bytes - std::min(base, budget->limit_bytes)) {
+        budget->limit_hit = true;
+        return nullptr;
+    }
+
+    auto* new_header = static_cast<BoundedAllocationHeader*>(
+        std::realloc(old_header, sizeof(BoundedAllocationHeader) + requested));
+    if (!new_header) return nullptr;
+    new_header->payload_bytes = requested;
+    budget->current_bytes = base + requested;
+    budget->peak_bytes = std::max(budget->peak_bytes, budget->current_bytes);
+    return new_header + 1;
+}
+
+static void configure_bounded_miniz_allocator(mz_zip_archive& zip,
+                                              MinizAllocationBudget& budget) {
+    zip.m_pAlloc = bounded_miniz_alloc;
+    zip.m_pFree = bounded_miniz_free;
+    zip.m_pRealloc = bounded_miniz_realloc;
+    zip.m_pAlloc_opaque = &budget;
+}
+
+struct ZipReaderScope {
+    mz_zip_archive* zip = nullptr;
+    MZ_FILE* external_file = nullptr;
+    bool initialized = false;
+
+    ~ZipReaderScope() {
+        if (initialized && zip) mz_zip_reader_end(zip);
+        if (external_file) std::fclose(external_file);
+    }
+};
+
+static std::string miniz_error_detail(mz_zip_archive& zip) {
+    const char* text = mz_zip_get_error_string(mz_zip_get_last_error(&zip));
+    return text ? text : "unknown miniz error";
+}
+
+static bool table_entry_offset(uint64_t table_offset,
+                               uint64_t index,
+                               uint64_t entry_size,
+                               size_t required_size,
+                               size_t file_size,
+                               size_t& out) {
+    if (entry_size < required_size) return false;
+    if (index != 0 && entry_size >
+        (std::numeric_limits<uint64_t>::max() - table_offset) / index) {
+        return false;
+    }
+    const uint64_t offset = table_offset + index * entry_size;
+    if (!valid_file_range(offset, required_size, file_size)) return false;
+    out = static_cast<size_t>(offset);
+    return true;
+}
+
+static size_t count_buffer_needles_icase(const std::vector<uint8_t>& hay,
+                                         const std::vector<std::string>& needles) {
+    auto ascii_lower = [](unsigned char c) -> unsigned char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+    };
+    size_t count = 0;
+    for (const auto& needle : needles) {
+        if (needle.empty() || needle.size() > hay.size()) continue;
+        auto found = std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
+            [&](uint8_t lhs, char rhs) {
+                return ascii_lower(lhs) == ascii_lower(static_cast<unsigned char>(rhs));
+            });
+        if (found != hay.end()) count++;
+    }
+    return count;
+}
+
+static size_t count_import_name_hits(const std::vector<std::string> &imports,
+                                     const std::vector<std::string> &names) {
+    std::unordered_set<std::string> wanted;
+    for (auto name : names) {
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c){ return (char)std::tolower(c); });
+        wanted.insert(std::move(name));
+    }
+
+    size_t count = 0;
+    for (auto imp : imports) {
+        std::transform(imp.begin(), imp.end(), imp.begin(),
+                       [](unsigned char c){ return (char)std::tolower(c); });
+        size_t version_pos = imp.find('@');
+        if (version_pos != std::string::npos) {
+            imp = imp.substr(0, version_pos);
+        }
+        if (wanted.count(imp)) count++;
+    }
+    return count;
 }
 
 static bool is_zip_magic(const std::vector<uint8_t>& buf) {
@@ -249,51 +414,137 @@ static bool is_zip_magic(const std::vector<uint8_t>& buf) {
            buf[3] == 0x04;
 }
 
-static bool is_elf_magic(const std::vector<uint8_t>& buf) {
-    return buf.size() >= 4 &&
-           buf[0] == 0x7f &&
-           buf[1] == 'E' &&
-           buf[2] == 'L' &&
-           buf[3] == 'F';
+static bool is_aarch64_elf64_little(const std::vector<uint8_t>& buf) {
+    Elf64_Ehdr_L eh{};
+    if (!read_struct(buf, 0, eh)) return false;
+    return eh.e_ident[0] == 0x7f &&
+           eh.e_ident[1] == 'E' &&
+           eh.e_ident[2] == 'L' &&
+           eh.e_ident[3] == 'F' &&
+           eh.e_ident[4] == ELFCLASS64_VAL &&
+           eh.e_ident[5] == ELFDATA2LSB_VAL &&
+           eh.e_machine == EM_AARCH64_VAL;
 }
 
-static bool extract_first_elf_from_zip_buffer(const std::vector<uint8_t>& zip_buf,
-                                              std::vector<uint8_t>& out_elf,
-                                              std::string& inner_name) {
+static bool extract_first_elf_from_zip_buffer(
+        const std::vector<uint8_t>& zip_buf,
+        std::vector<uint8_t>& out_elf,
+        std::string& inner_name,
+        const std::string& outer_entry_name,
+        std::vector<ScanDiagnostic>* diagnostics,
+        uint64_t* suppressed_diagnostics,
+        std::string& failure_code) {
+    MinizAllocationBudget allocation_budget{
+        static_cast<size_t>(obfuscan::ApkScanLimits::kMaxInnerZipMetadataBytes)};
     mz_zip_archive zip{};
     memset(&zip, 0, sizeof(zip));
+    configure_bounded_miniz_allocator(zip, allocation_budget);
+    ZipReaderScope scope{&zip, nullptr, false};
 
-    if (!mz_zip_reader_init_mem(&zip, zip_buf.data(), zip_buf.size(), 0)) {
+    auto report_inner = [&](const std::string& code,
+                            const std::string& inner_entry,
+                            uint64_t entry_index,
+                            uint64_t compressed_bytes,
+                            uint64_t uncompressed_bytes,
+                            const std::string& detail = std::string()) {
+        if (failure_code.empty()) failure_code = code;
+        if (!diagnostics || !suppressed_diagnostics) return;
+        const std::string qualified_name = inner_entry.empty()
+            ? outer_entry_name
+            : outer_entry_name + "!" + inner_entry;
+        record_scan_diagnostic(
+            *diagnostics, *suppressed_diagnostics,
+            ScanDiagnostic{"warning", code, qualified_name, detail, entry_index,
+                           compressed_bytes, uncompressed_bytes, true});
+    };
+
+    if (!mz_zip_reader_init_mem(&zip, zip_buf.data(), zip_buf.size(),
+                                MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY)) {
+        report_inner(allocation_budget.limit_hit ? "INNER_ZIP_METADATA_LIMIT"
+                                                 : "INNER_ZIP_OPEN_FAILED",
+                     "", 0, 0, 0, miniz_error_detail(zip));
+        return false;
+    }
+    scope.initialized = true;
+
+    mz_uint file_count = mz_zip_reader_get_num_files(&zip);
+    if (file_count > obfuscan::ApkScanLimits::kMaxInnerZipEntries) {
+        report_inner("INNER_ZIP_ENTRY_LIMIT", "", 0, 0, file_count);
         return false;
     }
 
-    mz_uint file_count = mz_zip_reader_get_num_files(&zip);
+    bool found = false;
+    uint64_t best_rank = 0;
+    uint64_t accepted_uncompressed_bytes = 0;
+    const obfuscan::ZipPayloadPolicy policy{
+        obfuscan::ApkScanLimits::kMaxSingleInnerEntryBytes,
+        obfuscan::ApkScanLimits::kMaxCompressionRatio,
+        obfuscan::ApkScanLimits::kCompressionRatioFloorBytes,
+    };
+
     for (mz_uint i = 0; i < file_count; ++i) {
         mz_zip_archive_file_stat st{};
-        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) {
+            report_inner("INNER_ZIP_ENTRY_STAT_FAILED", "", i, 0, 0,
+                         miniz_error_detail(zip));
+            continue;
+        }
         if (st.m_is_directory) continue;
 
-        size_t out_size = 0;
-        void* p = mz_zip_reader_extract_to_heap(&zip, i, &out_size, 0);
-        if (!p || out_size < 4) {
-            if (p) mz_free(p);
+        const obfuscan::ZipPayloadDecision decision = obfuscan::evaluate_zip_payload(
+            {st.m_comp_size, st.m_uncomp_size,
+             st.m_is_encrypted != 0, st.m_is_supported != 0},
+            policy);
+        if (decision == obfuscan::ZipPayloadDecision::kEmpty) continue;
+        if (decision != obfuscan::ZipPayloadDecision::kAllow) {
+            report_inner("INNER_ZIP_" +
+                             std::string(obfuscan::zip_payload_decision_code(decision)),
+                         st.m_filename, i, st.m_comp_size, st.m_uncomp_size);
             continue;
         }
 
-        std::vector<uint8_t> tmp(out_size);
-        memcpy(tmp.data(), p, out_size);
-        mz_free(p);
+        if (!obfuscan::fits_cumulative_budget(
+                accepted_uncompressed_bytes, st.m_uncomp_size,
+                obfuscan::ApkScanLimits::kMaxTotalInnerEntryBytes)) {
+            report_inner("INNER_ZIP_TOTAL_UNCOMPRESSED_LIMIT", st.m_filename, i,
+                         st.m_comp_size, st.m_uncomp_size);
+            continue;
+        }
+        accepted_uncompressed_bytes += st.m_uncomp_size;
 
-        if (is_elf_magic(tmp)) {
-            out_elf = std::move(tmp);
-            inner_name = st.m_filename ? st.m_filename : "";
-            mz_zip_reader_end(&zip);
-            return true;
+        std::vector<uint8_t> tmp;
+        try {
+            tmp.resize(static_cast<size_t>(st.m_uncomp_size));
+        } catch (const std::bad_alloc&) {
+            report_inner("INNER_ZIP_ALLOCATION_FAILED", st.m_filename, i,
+                         st.m_comp_size, st.m_uncomp_size);
+            continue;
+        }
+
+        if (!mz_zip_reader_extract_to_mem(&zip, i, tmp.data(), tmp.size(), 0)) {
+            report_inner("INNER_ZIP_EXTRACT_FAILED", st.m_filename, i,
+                         st.m_comp_size, st.m_uncomp_size, miniz_error_detail(zip));
+            continue;
+        }
+
+        const bool elf_magic = tmp.size() >= 4 && tmp[0] == 0x7f && tmp[1] == 'E' &&
+                               tmp[2] == 'L' && tmp[3] == 'F';
+        if (elf_magic) {
+            uint64_t rank = static_cast<uint64_t>(tmp.size());
+            if (is_aarch64_elf64_little(tmp)) {
+                rank += (1ULL << 62);
+            }
+
+            if (!found || rank > best_rank) {
+                found = true;
+                best_rank = rank;
+                out_elf = std::move(tmp);
+                inner_name = st.m_filename;
+            }
         }
     }
 
-    mz_zip_reader_end(&zip);
-    return false;
+    return found;
 }
 
 // =========================
@@ -303,6 +554,7 @@ static bool extract_first_elf_from_zip_buffer(const std::vector<uint8_t>& zip_bu
 struct SectionInfo {
     std::string name;
     uint32_t type = 0;
+    uint64_t address = 0;
     uint64_t offset = 0;
     uint64_t size = 0;
     uint64_t flags = 0;
@@ -325,11 +577,10 @@ struct EntryPreview {
     std::vector<DisasmLine> lines;
 };
 
-struct VmpDeepResult {
-    bool analyzed = false;
-    bool possible = false;
-    double score = 0.0;
-    std::vector<std::string> signals;
+struct DefinedFunctionRange {
+    std::string name;
+    uint64_t address = 0;
+    uint64_t size = 0;
 };
 
 struct AnalysisResult {
@@ -347,10 +598,21 @@ struct AnalysisResult {
     bool has_init_array = false;
     bool has_jni_onload_string = false;
     bool rwx_segment = false;
+    bool entry_in_writable_segment = false;
 
     bool is_zip_container = false;
     bool inner_elf_found = false;
+    bool known_hook_framework = false;
+    bool known_runtime_framework = false;
+    bool known_vm_runtime = false;
+    bool embedded_cxxabi_runtime = false;
+    uint8_t runtime_evidence_classes = 0;
+    size_t runtime_raw_identity_hits = 0;
+    size_t runtime_import_api_hits = 0;
+    bool possible_custom_linker = false;
     std::string format_note;
+    std::string known_framework_name;
+    std::string known_runtime_name;
 
     uint16_t section_count = 0;
     uint16_t ph_count = 0;
@@ -370,6 +632,9 @@ struct AnalysisResult {
     size_t exported_dynsym_count = 0;
 
     std::vector<std::string> imports;
+    std::vector<std::string> needed_libraries;
+    std::vector<std::string> defined_exports;
+    std::vector<DefinedFunctionRange> defined_function_ranges;
     std::vector<SectionInfo> sections;
     std::vector<SegmentInfo> segments;
     A64StatsEx a64;
@@ -380,6 +645,11 @@ struct AnalysisResult {
     double packer_score = 0.0;
     double ollvm_score = 0.0;
     double strong_obf_score = 0.0;
+    double custom_linker_score = 0.0;
+    bool vmp_protected_client = false;
+    std::string vmp_provider_so;
+    std::string vmp_needed_library;
+    std::vector<std::string> vmp_shared_symbols;
     std::string final_label;
     std::vector<std::string> reasons;
 };
@@ -389,10 +659,10 @@ static bool va_to_file_offset(uint64_t va,
                               uint64_t& out_off) {
     for (const auto& seg : segments) {
         if (seg.type != PT_LOAD_VAL) continue;
-        uint64_t begin = seg.vaddr;
-        uint64_t end = seg.vaddr + seg.filesz;
-        if (va >= begin && va < end) {
-            out_off = seg.offset + (va - begin);
+        if (va >= seg.vaddr && va - seg.vaddr < seg.filesz) {
+            const uint64_t delta = va - seg.vaddr;
+            if (delta > std::numeric_limits<uint64_t>::max() - seg.offset) continue;
+            out_off = seg.offset + delta;
             return true;
         }
     }
@@ -423,423 +693,284 @@ static void add_entry_preview(AnalysisResult& r,
     }
 }
 
+static std::vector<AddressRange> find_dynamic_plt_branch_ranges(
+        const std::vector<ExecutableRegionView>& regions,
+        const std::vector<uint64_t>& jump_slot_vas);
+
 
 
 
 
 static bool is_high_risk_result(const AnalysisResult& r) {
-    return r.packer_score >= 0.70 || r.strong_obf_score >= 0.72;
+    return r.vmp_protected_client ||
+           r.possible_custom_linker ||
+           r.packer_score >= 0.68 ||
+           r.strong_obf_score >= 0.70 ||
+           r.vmp.possible ||
+           (r.packer_score >= 0.62 && r.strong_obf_score >= 0.58) ||
+           (r.ollvm_score >= 0.65 && r.strong_obf_score >= 0.60);
 }
 
-static std::string to_lower_copy(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
+static bool is_medium_risk_result(const AnalysisResult& r) {
+    return r.known_hook_framework ||
+           r.custom_linker_score >= 0.50 ||
+           r.packer_score >= 0.45 ||
+           r.ollvm_score >= 0.50 ||
+           r.strong_obf_score >= 0.50 ||
+           r.vmp.score >= 0.50;
+}
+
+static std::string path_basename_lower(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    std::string base = (pos == std::string::npos) ? path : path.substr(pos + 1);
+    std::transform(base.begin(), base.end(), base.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
-    return s;
+    return base;
 }
 
-static std::string trim_copy(const std::string& s) {
-    size_t l = 0;
-    while (l < s.size() && std::isspace((unsigned char)s[l])) l++;
-    size_t r = s.size();
-    while (r > l && std::isspace((unsigned char)s[r - 1])) r--;
-    return s.substr(l, r - l);
-}
+static bool is_known_runtime_library_name(const std::string& base, std::string& family) {
+    struct KnownName {
+        const char* needle;
+        const char* family;
+    };
 
-static std::string normalize_reg(std::string s) {
-    s = trim_copy(to_lower_copy(s));
-    while (!s.empty() && (s.back() == ',' || s.back() == ']' || s.back() == '!')) s.pop_back();
-    while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
+    static const KnownName names[] = {
+        {"libreact", "React Native"},
+        {"librn", "React Native"},
+        {"libhermes", "Hermes/React Native"},
+        {"libjsi", "React Native JSI"},
+        {"libjsc", "JavaScriptCore/React Native"},
+        {"libturbomodule", "React Native TurboModule"},
+        {"libuimanager", "React Native UIManager"},
+        {"libmapbuffer", "React Native MapBuffer"},
+        {"libyoga", "Yoga layout"},
+        {"libfbjni", "fbjni"},
+        {"libglog", "glog"},
+        {"libsentry", "Sentry native"},
+        {"libgifimage", "image codec"},
+        {"libglide-webp", "image codec"},
+        {"libnative-imagetranscoder", "image codec"},
+        {"libreanimated", "React Native Reanimated"},
+        {"libvisioncamera", "React Native VisionCamera"},
+        {"libjscexecutor", "React Native JS executor"},
+        {"libjserrorhandler", "React Native JS error handler"},
+        {"libjsinspector", "React Native JS inspector"},
+        {"libjsijniprofiler", "React Native JSI profiler"},
+        {"libnative-filters", "image filter"},
+        {"libmetis", "Metis/native graph library"},
+        {"liblogger", "native logging"},
+        {"libtt_ugen_layout", "layout engine"}
+    };
 
-    if (s == "sp") return s;
-    if (s.size() >= 2 && (s[0] == 'x' || s[0] == 'w')) {
-        bool ok = true;
-        for (size_t i = 1; i < s.size(); ++i) {
-            if (!std::isdigit((unsigned char)s[i])) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
-            if (s[0] == 'w') s[0] = 'x';
-            return s;
-        }
-    }
-    return "";
-}
-
-static std::string extract_operand_reg_at(const std::string& op_str, int index) {
-    std::string s = to_lower_copy(op_str);
-    int cur = 0;
-    size_t i = 0;
-
-    while (i < s.size()) {
-        while (i < s.size() && (std::isspace((unsigned char)s[i]) || s[i] == ',')) i++;
-        if (i >= s.size()) break;
-
-        size_t j = i;
-        int bracket_depth = 0;
-        while (j < s.size()) {
-            if (s[j] == '[') bracket_depth++;
-            else if (s[j] == ']') bracket_depth--;
-            else if (s[j] == ',' && bracket_depth == 0) break;
-            j++;
-        }
-
-        if (cur == index) {
-            std::string token = trim_copy(s.substr(i, j - i));
-            size_t p = 0;
-            while (p < token.size() && token[p] == '[') p++;
-            size_t q = p;
-            while (q < token.size() && !std::isspace((unsigned char)token[q]) && token[q] != ',' && token[q] != ']') q++;
-            return normalize_reg(token.substr(p, q - p));
-        }
-
-        cur++;
-        i = j + 1;
-    }
-
-    return "";
-}
-
-static std::string extract_first_operand_reg(const std::string& op_str) {
-    return extract_operand_reg_at(op_str, 0);
-}
-
-static std::string extract_second_operand_reg(const std::string& op_str) {
-    return extract_operand_reg_at(op_str, 1);
-}
-
-static std::string extract_branch_target_reg(const std::string& op_str) {
-    return extract_first_operand_reg(op_str);
-}
-
-static std::string extract_mem_base_reg(const std::string& op_str) {
-    std::string s = to_lower_copy(op_str);
-    size_t p = s.find('[');
-    if (p == std::string::npos) return "";
-
-    p++;
-    while (p < s.size() && std::isspace((unsigned char)s[p])) p++;
-    if (p >= s.size()) return "";
-
-    if (p + 1 < s.size() && s[p] == 's' && s[p + 1] == 'p') {
-        return "sp";
-    }
-
-    if (s[p] == 'x' || s[p] == 'w') {
-        size_t q = p + 1;
-        while (q < s.size() && std::isdigit((unsigned char)s[q])) q++;
-        return normalize_reg(s.substr(p, q - p));
-    }
-
-    return "";
-}
-
-static bool has_post_index_advance(const std::string& op_str, const std::string& base_reg) {
-    std::string s = to_lower_copy(op_str);
-    std::string needle1 = "[" + base_reg + "], #";
-    std::string needle2 = "[" + base_reg + "],#";
-    return s.find(needle1) != std::string::npos ||
-           s.find(needle2) != std::string::npos;
-}
-
-static bool is_add_sub_same_reg(const DisasmInsn& ins, const std::string& reg) {
-    if (!(ins.mnemonic == "add" || ins.mnemonic == "sub")) return false;
-    std::string d = extract_first_operand_reg(ins.op_str);
-    std::string s1 = extract_second_operand_reg(ins.op_str);
-    return !reg.empty() && d == reg && s1 == reg;
-}
-
-static bool is_small_load_mnemonic(const std::string& m) {
-    return m == "ldrb" || m == "ldrh" || m == "ldrsb" || m == "ldrsh";
-}
-
-static bool is_load_mnemonic(const std::string& m) {
-    return starts_with(m, "ldr") || m == "ldp" || m == "ldur";
-}
-
-static bool is_logic_shift_mnemonic(const std::string& m) {
-    return m == "add" || m == "sub" || m == "subs" ||
-           m == "eor" || m == "and" || m == "ands" || m == "orr" ||
-           m == "lsl" || m == "lsr" || m == "asr" ||
-           m == "ubfx" || m == "sbfx" || m == "extr" ||
-           m == "cmp" || m == "cmn" || m == "tst";
-}
-
-static bool is_adr_base_mnemonic(const std::string& m) {
-    return m == "adr" || m == "adrp";
-}
-
-static bool has_large_entropy_blob_for_vmp(const AnalysisResult& r) {
-    for (const auto& sec : r.sections) {
-        if (sec.size >= 32 * 1024 &&
-            sec.entropy >= 7.2 &&
-            sec.name != ".text" &&
-            sec.name != ".plt") {
+    for (const auto& item : names) {
+        if (base.find(item.needle) != std::string::npos) {
+            family = item.family;
             return true;
         }
     }
     return false;
 }
 
-struct VmWindowMatch {
-    bool strict = false;
-    bool medium = false;
-    std::string vip_reg;
-    std::string br_reg;
+struct RuntimeEvidence {
+    std::string family;
+    bool basename_hit = false;
+    bool raw_identity_hit = false;
+    bool import_api_hit = false;
+    size_t raw_hits = 0;
+    size_t import_hits = 0;
+
+    uint8_t evidence_classes() const {
+        return static_cast<uint8_t>(basename_hit) +
+               static_cast<uint8_t>(raw_identity_hit) +
+               static_cast<uint8_t>(import_api_hit);
+    }
+    bool present() const { return evidence_classes() != 0; }
+    bool confirmed() const { return evidence_classes() >= 2; }
 };
 
-static VmWindowMatch match_vm_window_strict(const std::vector<DisasmInsn>& insns,
-                                            size_t begin,
-                                            size_t len) {
-    VmWindowMatch wm{};
-    if (begin + len > insns.size()) return wm;
+static RuntimeEvidence detect_known_vm_or_branch_runtime(
+        const std::string& basename,
+        const std::vector<uint8_t>& image,
+        const std::vector<std::string>& imports) {
+    RuntimeEvidence best;
+    auto consider = [&](const char* family,
+                        bool basename_hit,
+                        const std::vector<std::string>& identity_needles,
+                        const std::vector<std::string>& api_names) {
+        RuntimeEvidence candidate;
+        candidate.family = family;
+        candidate.basename_hit = basename_hit;
+        candidate.raw_hits = count_buffer_needles_icase(image, identity_needles);
+        candidate.import_hits = count_import_name_hits(imports, api_names);
+        candidate.raw_identity_hit = candidate.raw_hits >= 2;
+        candidate.import_api_hit = candidate.import_hits >= 2;
+        if (!candidate.present()) return;
+        const auto rank = [](const RuntimeEvidence& item) {
+            return std::make_pair(item.evidence_classes(), item.raw_hits + item.import_hits);
+        };
+        if (!best.present() || rank(candidate) > rank(best)) best = std::move(candidate);
+    };
 
-    bool has_fetch = false;
-    bool has_advance = false;
-    bool has_br = false;
-    int logic_count = 0;
-    size_t br_pos = (size_t)-1;
-
-    std::string vip_reg;
-    std::string br_reg;
-
-    for (size_t i = begin; i < begin + len; ++i) {
-        const auto& ins = insns[i];
-        const std::string& m = ins.mnemonic;
-
-        if (is_small_load_mnemonic(m)) {
-            std::string base = extract_mem_base_reg(ins.op_str);
-            if (!base.empty()) {
-                has_fetch = true;
-                if (vip_reg.empty()) vip_reg = base;
-                if (has_post_index_advance(ins.op_str, base)) {
-                    has_advance = true;
-                }
-            }
-        }
-
-        if (!vip_reg.empty() && is_add_sub_same_reg(ins, vip_reg)) {
-            has_advance = true;
-        }
-
-        if (m == "br") {
-            has_br = true;
-            br_pos = i - begin;
-            br_reg = extract_branch_target_reg(ins.op_str);
-        }
-
-        if (is_logic_shift_mnemonic(m)) {
-            logic_count++;
-        }
+    const bool libcxx_name = basename == "libc++_shared.so" ||
+                             basename == "libc++_shared_64.so" ||
+                             basename == "libstlport_shared.so" ||
+                             basename == "libgnustl_shared.so";
+    // C++ ABI symbols occur in almost every native library, so they are only
+    // an SO-wide alternative when the SONAME itself is the shared C++ runtime.
+    if (libcxx_name) {
+        consider("C++ runtime callback/virtual dispatch", true,
+                 {"std::__ndk1", "LLVM libc++", "__cxa_demangle", "__gxx_personality_v0",
+                  "__vmi_class_type_info", "__cxxabi"},
+                 {"__cxa_throw", "__cxa_begin_catch", "__cxa_end_catch", "__gxx_personality_v0"});
     }
-
-    bool br_at_tail = (br_pos != (size_t)-1 && br_pos >= len - 4);
-
-    wm.medium = has_fetch && has_br && logic_count >= 1 && !vip_reg.empty() && !br_reg.empty();
-    wm.strict = has_fetch && has_advance && has_br && logic_count >= 2 &&
-                br_at_tail && !vip_reg.empty() && !br_reg.empty();
-    wm.vip_reg = vip_reg;
-    wm.br_reg = br_reg;
-    return wm;
+    consider("Nano Compose expression/layout runtime",
+             basename.find("nano_compose") != std::string::npos,
+             {"ComposeFunc", "ExprIDValue", "OpGroupValue", "LayoutNode"}, {});
+    consider("QuickJS bytecode runtime",
+             basename.find("quickjs") != std::string::npos,
+             {"QuickJS", "JS_EvalInternal", "JS_CallInternal", "JS_ExecutePendingJob"},
+             {"JS_NewRuntime", "JS_NewContext", "JS_Eval", "JS_ExecutePendingJob"});
+    const bool ffmpeg_name = basename.find("ffmpeg") != std::string::npos ||
+        basename == "libavcodec.so" || basename == "libavutil.so" ||
+        basename == "libavfilter.so" || basename == "libavformat.so" ||
+        basename == "libswscale.so" || basename == "libavdevice.so" ||
+        basename == "libijkplayer.so";
+    // A basename is deliberately only one evidence class.  At least one
+    // independent identity-string or imported-API class is still required by
+    // RuntimeEvidence::confirmed() before this can override a VMP verdict.
+    consider("FFmpeg/media codec runtime", ffmpeg_name,
+              {"FFmpeg version", "Lavc", "Lavf", "Lavu", "Lavfi", "Sws",
+               "ff_h264_", "libavcodec", "libavutil", "libavformat",
+               "libavfilter", "libswscale", "ijkplayer"},
+              {"avcodec_send_packet", "avcodec_receive_frame", "avformat_open_input",
+               "av_read_frame", "av_malloc", "av_free", "av_log", "av_frame_alloc",
+               "sws_scale", "avfilter_graph_alloc"});
+    consider("SQLite VDBE runtime",
+             basename.find("sqlite") != std::string::npos,
+             {"SQLite format 3", "sqlite3VdbeExec", "database disk image is malformed",
+              "malformed database schema", "sqlite_master", "sqlite_sequence"},
+             {"sqlite3_prepare_v2", "sqlite3_step", "sqlite3_finalize", "sqlite3_open_v2"});
+    consider("Unicorn/Flutter UI runtime",
+             basename == "libunicorn.so" || basename.rfind("libunicorn_", 0) == 0,
+             {"Unicorn Engine", "unicorn_render_engine", "FlutterJNI",
+              "FlutterMutatorsStack", "unicorn_library_loader"}, {});
+    consider("CPU emulation runtime",
+             basename.find("unicorn") != std::string::npos ||
+                 basename.find("qemu") != std::string::npos,
+             {"unicorn engine", "qemu-system", "cpu_exec", "uc_version"},
+             {"uc_open", "uc_emu_start", "uc_hook_add", "uc_close"});
+    consider("Hermes JavaScript runtime",
+             basename.find("hermes") != std::string::npos,
+             {"facebook::hermes", "HermesRuntime", "Hermes bytecode", "HermesVM"},
+             {"hermes_create_runtime", "hermes_get_runtime_properties"});
+    const bool lua_name = basename.rfind("liblua", 0) == 0 ||
+                          basename.rfind("lua", 0) == 0;
+    consider("Lua bytecode runtime", lua_name,
+             {"Lua 5.", "luaV_execute", "luaD_precall", "luaG_runerror"},
+             {"lua_pcall", "lua_pcallk", "lua_newstate", "luaL_newstate"});
+    const bool jsc_name = basename.rfind("libjsc", 0) == 0 ||
+                          basename.find("javascriptcore") != std::string::npos;
+    consider("JavaScriptCore runtime", jsc_name,
+             {"JavaScriptCore", "JSC::VM", "WTF::", "JSGlobalObject"},
+             {"JSEvaluateScript", "JSGlobalContextCreate", "JSContextGroupCreate"});
+    const bool wasm_name = basename.rfind("libwasm", 0) == 0 ||
+                           basename.find("webassembly") != std::string::npos;
+    consider("WebAssembly runtime", wasm_name,
+             {"WebAssembly", "wasm interpreter", "wasm_runtime", "WASM bytecode"},
+             {"wasm_runtime_init", "wasm_runtime_load", "wasm_runtime_instantiate"});
+    const bool regex_name = basename.rfind("libpcre", 0) == 0 ||
+                            basename.rfind("libre2", 0) == 0 ||
+                            basename.rfind("libregex", 0) == 0;
+    consider("regular-expression runtime", regex_name,
+             {"PCRE2", "pcre2_match", "regex bytecode", "RE2::"},
+             {"pcre_exec", "pcre2_match", "regexec"});
+    return best;
 }
 
-static VmpDeepResult analyze_vmp_deep(const AnalysisResult& base,
-                                      const std::vector<uint8_t>& work_buf,
-                                      const uint8_t* text_ptr,
-                                      size_t text_size,
-                                      uint64_t text_base_addr) {
-    VmpDeepResult vr;
-    vr.analyzed = true;
-
-    if (!text_ptr || text_size < 128) {
-        return vr;
-    }
-
-    Arm64DisasmEngine engine;
-    if (!engine.init()) {
-        vr.signals.push_back("Capstone深度反汇编初始化失败");
-        return vr;
-    }
-
-    size_t scan_bytes = std::min<size_t>(text_size, 256 * 1024);
-    auto insns = engine.disasm_all(text_ptr, scan_bytes, text_base_addr, 0);
-    if (insns.size() < 96) {
-        return vr;
-    }
-
-    size_t br_count = 0;
-    size_t blr_count = 0;
-    size_t small_load_count = 0;
-    size_t logic_shift_count = 0;
-
-    std::unordered_map<std::string, int> br_reg_freq;
-    std::unordered_map<std::string, int> strict_vip_freq;
-    std::unordered_map<std::string, int> strict_br_freq;
-
-    for (const auto& ins : insns) {
-        const std::string& m = ins.mnemonic;
-        if (m == "br") {
-            br_count++;
-            std::string r = extract_branch_target_reg(ins.op_str);
-            if (!r.empty()) br_reg_freq[r]++;
-        } else if (m == "blr") {
-            blr_count++;
-        }
-
-        if (is_small_load_mnemonic(m)) small_load_count++;
-        if (is_logic_shift_mnemonic(m)) logic_shift_count++;
-    }
-
-    int strict_windows = 0;
-    int medium_windows = 0;
-
-    const size_t W = 12;
-    for (size_t i = 0; i + W <= insns.size(); ++i) {
-        VmWindowMatch wm = match_vm_window_strict(insns, i, W);
-        if (wm.medium) medium_windows++;
-        if (wm.strict) {
-            strict_windows++;
-            strict_vip_freq[wm.vip_reg]++;
-            strict_br_freq[wm.br_reg]++;
-        }
-    }
-
-    int max_same_vip = 0;
-    for (const auto& kv : strict_vip_freq) {
-        if (kv.second > max_same_vip) max_same_vip = kv.second;
-    }
-
-    int max_same_br = 0;
-    for (const auto& kv : strict_br_freq) {
-        if (kv.second > max_same_br) max_same_br = kv.second;
-    }
-
-    double br_density = insns.empty() ? 0.0 : double(br_count) / double(insns.size());
-    double blr_density = insns.empty() ? 0.0 : double(blr_count) / double(insns.size());
-    double small_load_ratio = insns.empty() ? 0.0 : double(small_load_count) / double(insns.size());
-    double logic_ratio = insns.empty() ? 0.0 : double(logic_shift_count) / double(insns.size());
-
-    double score = 0.0;
-
-    if (strict_windows >= 5) {
-        score += 0.40;
-        vr.signals.push_back("重复出现高置信度取字节码-推进VIP-br分发窗口");
-    } else if (strict_windows >= 3) {
-        score += 0.25;
-        vr.signals.push_back("出现多处高置信度取字节码-br分发窗口");
-    }
-
-    if (max_same_vip >= 4) {
-        score += 0.18;
-        vr.signals.push_back("同一VIP寄存器重复出现");
-    } else if (max_same_vip >= 3) {
-        score += 0.10;
-        vr.signals.push_back("疑似VIP寄存器重复出现");
-    }
-
-    if (max_same_br >= 4) {
-        score += 0.16;
-        vr.signals.push_back("同一br目标寄存器重复作为分发出口");
-    } else if (max_same_br >= 3) {
-        score += 0.10;
-        vr.signals.push_back("疑似固定分发寄存器");
-    }
-
-    if (br_count >= 8 && br_density >= 0.004) {
-        score += 0.10;
-        vr.signals.push_back("br分发指令数量偏高");
-    } else if (br_count >= 5 && br_density >= 0.0025) {
-        score += 0.05;
-        vr.signals.push_back("存在一定数量的br分发指令");
-    }
-
-    if (medium_windows >= 10) {
-        score += 0.08;
-        vr.signals.push_back("中等置信度解释器窗口较多");
-    }
-
-    if (has_large_entropy_blob_for_vmp(base)) {
-        score += 0.05;
-        vr.signals.push_back("存在较大高熵疑似字节码/handler数据区");
-    }
-
-    if (small_load_ratio >= 0.03) {
-        score += 0.04;
-        vr.signals.push_back("字节/半字读取比例偏高");
-    }
-
-    if (logic_ratio >= 0.10) {
-        score += 0.04;
-        vr.signals.push_back("位运算/比较密度偏高");
-    }
-
-    if (base.import_count <= 8 && base.has_init_array) {
-        score += 0.03;
-        vr.signals.push_back("导入较少且存在早期初始化入口");
-    }
-
-    // 强力反误报：如果 blr 明显多于 br，更像虚表/函数指针调用，不像 dispatcher
-    if (blr_count > br_count * 2 && br_count < 8) {
-        score -= 0.20;
-        vr.signals.push_back("blr占优，更像虚表/函数指针调用");
-    }
-
-    // 另一个反误报：没有 strict window 基本不认 VMP
-    if (strict_windows == 0) {
-        score -= 0.20;
-    }
-
-    vr.score = clamp01(score);
-
-    vr.possible =
-        (vr.score >= 0.72) &&
-        (strict_windows >= 3) &&
-        (max_same_vip >= 3) &&
-        (max_same_br >= 3) &&
-        (br_count >= 5);
-
-    return vr;
+static bool is_known_non_vm_candidate_function(const std::string& symbol) {
+    std::string lower = symbol;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return symbol.find("_M_open") != std::string::npos ||
+           symbol.find("cJSON_PrintBuffered") != std::string::npos ||
+           symbol.find("__do_find_public_src") != std::string::npos ||
+           symbol.find("av_sscanf") != std::string::npos ||
+           symbol.find("__cxa_demangle") != std::string::npos ||
+           lower.find("demangler") != std::string::npos;
 }
 
+static bool is_cxxabi_runtime_anchor_function(const std::string& symbol) {
+    return symbol.rfind("__cxa_", 0) == 0 ||
+           symbol == "__gxx_personality_v0" ||
+           symbol == "__dynamic_cast" ||
+           symbol.find("__cxxabi") != std::string::npos;
+}
 
-
-static AnalysisResult analyze_so(const std::string &name, const std::vector<uint8_t> &input_buf) {
+static AnalysisResult analyze_so(const std::string &name,
+                                 const std::vector<uint8_t> &input_buf,
+                                 std::vector<ScanDiagnostic>* diagnostics = nullptr,
+                                 uint64_t* suppressed_diagnostics = nullptr) {
     AnalysisResult r;
     r.so_name = name;
     r.file_size = input_buf.size();
 
 
-    if (name.find("assets/") != std::string::npos) {
-        r.reasons.push_back("从assets目录加载，可能使用了某种加固");
+    bool loaded_from_assets = (name.find("assets/") != std::string::npos);
+    if (loaded_from_assets) {
+        r.reasons.push_back("loaded from assets path");
+    }
+    std::string so_basename = path_basename_lower(name);
+    if (is_known_runtime_library_name(so_basename, r.known_runtime_name)) {
+        r.known_runtime_framework = true;
+    }
+    if (so_basename.find("pine") != std::string::npos) {
+        r.known_hook_framework = true;
+        r.known_framework_name = "Pine";
     }
 
-    std::vector<uint8_t> work_buf = input_buf;
+    std::vector<uint8_t> inner_work_buf;
+    const std::vector<uint8_t>* work_buf_ptr = &input_buf;
 
-    if (is_zip_magic(work_buf)) {
+    if (is_zip_magic(input_buf)) {
         r.is_zip_container = true;
         r.format_note = "ZIP伪装SO";
 
-        std::vector<uint8_t> inner_elf;
         std::string inner_name;
-        if (extract_first_elf_from_zip_buffer(work_buf, inner_elf, inner_name)) {
+        std::string inner_failure_code;
+        if (extract_first_elf_from_zip_buffer(
+                input_buf, inner_work_buf, inner_name, name,
+                diagnostics, suppressed_diagnostics, inner_failure_code)) {
             r.inner_elf_found = true;
             r.format_note = "ZIP伪装SO，已提取内层ELF";
             r.reasons.push_back("so entry is actually a zip container");
-            work_buf = std::move(inner_elf);
+            work_buf_ptr = &inner_work_buf;
         } else {
             r.final_label = "ZIP_SO_CONTAINER";
             r.reasons.push_back("so entry is actually a zip container");
+            r.packer_score = 0.78;
+            r.strong_obf_score = 0.68;
+            if (!inner_failure_code.empty()) {
+                r.reasons.push_back("inner ZIP scan stopped: " + inner_failure_code);
+                r.vmp.outcome = "PARTIAL_ANALYSIS";
+                r.vmp.limitation = "Inner ZIP analysis stopped safely: " +
+                                   inner_failure_code;
+            } else {
+                r.vmp.outcome = "INCONCLUSIVE_PACKED";
+                r.vmp.limitation = "No observable inner ELF was found in the container";
+            }
+            r.vmp.confidence = "UNKNOWN";
             return r;
         }
     }
+
+    const std::vector<uint8_t>& work_buf = *work_buf_ptr;
 
     r.analyzed_file_size = work_buf.size();
     r.file_entropy = shannon_entropy(work_buf.data(), work_buf.size());
     r.printable_string_count = count_printable_strings(work_buf, 4);
 
-    auto all_strings = extract_printable_strings(work_buf, 4, 6000);
-    r.has_jni_onload_string = contains_string_icase(all_strings, "JNI_OnLoad");
+    r.has_jni_onload_string =
+        count_buffer_needles_icase(work_buf, {"JNI_OnLoad"}) != 0;
 
     if (work_buf.size() < sizeof(Elf64_Ehdr_L)) {
         r.final_label = "INVALID_ELF";
@@ -881,7 +1012,9 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
 
     for (uint16_t i = 0; i < eh.e_shnum; ++i) {
         Elf64_Shdr_L sh{};
-        size_t off = static_cast<size_t>(eh.e_shoff) + static_cast<size_t>(i) * eh.e_shentsize;
+        size_t off = 0;
+        if (!table_entry_offset(eh.e_shoff, i, eh.e_shentsize,
+                                sizeof(sh), work_buf.size(), off)) break;
         if (!read_struct(work_buf, off, sh)) break;
         shdrs.push_back(sh);
     }
@@ -889,9 +1022,10 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
     std::vector<uint8_t> shstrtab;
     if (eh.e_shstrndx < shdrs.size()) {
         const auto &shstr = shdrs[eh.e_shstrndx];
-        if (shstr.sh_offset + shstr.sh_size <= work_buf.size()) {
-            shstrtab.assign(work_buf.begin() + shstr.sh_offset,
-                            work_buf.begin() + shstr.sh_offset + shstr.sh_size);
+        if (valid_file_range(shstr.sh_offset, shstr.sh_size, work_buf.size())) {
+            const size_t begin = static_cast<size_t>(shstr.sh_offset);
+            const size_t end = begin + static_cast<size_t>(shstr.sh_size);
+            shstrtab.assign(work_buf.begin() + begin, work_buf.begin() + end);
         }
     }
 
@@ -902,11 +1036,12 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
         SectionInfo si;
         si.name = get_cstr_from_table(shstrtab, sh.sh_name);
         si.type = sh.sh_type;
+        si.address = sh.sh_addr;
         si.offset = sh.sh_offset;
         si.size = sh.sh_size;
         si.flags = sh.sh_flags;
 
-        if (si.offset + si.size <= work_buf.size() && si.size > 0) {
+        if (valid_file_range(si.offset, si.size, work_buf.size()) && si.size > 0) {
             si.entropy = shannon_entropy(work_buf.data() + si.offset, static_cast<size_t>(si.size));
             r.max_section_entropy = std::max(r.max_section_entropy, si.entropy);
         }
@@ -931,10 +1066,13 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
 
     uint64_t exec_entropy_count = 0;
     double exec_entropy_sum = 0.0;
+    std::vector<ExecutableRegionView> executable_regions;
 
     for (uint16_t i = 0; i < eh.e_phnum; ++i) {
         Elf64_Phdr_L ph{};
-        size_t off = static_cast<size_t>(eh.e_phoff) + static_cast<size_t>(i) * eh.e_phentsize;
+        size_t off = 0;
+        if (!table_entry_offset(eh.e_phoff, i, eh.e_phentsize,
+                                sizeof(ph), work_buf.size(), off)) break;
         if (!read_struct(work_buf, off, ph)) break;
 
         SegmentInfo sg;
@@ -951,42 +1089,123 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
             r.rwx_segment = true;
         }
 
+        if (eh.e_entry != 0 &&
+            ph.p_type == PT_LOAD_VAL &&
+            (ph.p_flags & PF_W_VAL) &&
+            eh.e_entry >= ph.p_vaddr &&
+            eh.e_entry - ph.p_vaddr < ph.p_memsz) {
+            r.entry_in_writable_segment = true;
+        }
+
         if (ph.p_type == PT_LOAD_VAL &&
             (ph.p_flags & PF_X_VAL) &&
-            ph.p_offset + ph.p_filesz <= work_buf.size() &&
+            valid_file_range(ph.p_offset, ph.p_filesz, work_buf.size()) &&
+            ph.p_vaddr <= UINT64_MAX - ph.p_filesz &&
             ph.p_filesz > 0) {
             double e = shannon_entropy(work_buf.data() + ph.p_offset, static_cast<size_t>(ph.p_filesz));
             exec_entropy_sum += e;
             exec_entropy_count++;
+
+            ExecutableRegionView region;
+            region.data = work_buf.data() + static_cast<size_t>(ph.p_offset);
+            region.size = static_cast<size_t>(ph.p_filesz);
+            region.virtual_address = ph.p_vaddr;
+            region.name = "PT_LOAD[" + std::to_string(i) + "]";
+            executable_regions.push_back(std::move(region));
         }
     }
 
     if (exec_entropy_count > 0) {
         r.avg_exec_entropy = exec_entropy_sum / double(exec_entropy_count);
     }
+    if (r.text_size == 0) {
+        for (const auto& region : executable_regions) {
+            if (r.text_size > UINT64_MAX - region.size) {
+                r.text_size = UINT64_MAX;
+                break;
+            }
+            r.text_size += region.size;
+        }
+    }
+
+    std::vector<obfuscan::elf_dynamic::Segment> dynamic_segments;
+    dynamic_segments.reserve(r.segments.size());
+    for (const auto& seg : r.segments) {
+        dynamic_segments.push_back({seg.type, seg.flags, seg.offset, seg.vaddr,
+                                    seg.filesz, seg.memsz});
+    }
+    const obfuscan::elf_dynamic::ParseResult dynamic_info =
+        obfuscan::elf_dynamic::parse(work_buf, dynamic_segments);
+    if (dynamic_info.valid) {
+        r.has_dynsym = r.has_dynsym || dynamic_info.has_symbol_table;
+        if (dynamic_info.has_init_array) {
+            r.has_init_array = true;
+            r.init_array_offset = dynamic_info.init_array_file_offset;
+            r.init_array_size = dynamic_info.init_array_size;
+        }
+    }
 
     std::vector<uint8_t> dynstr;
     std::vector<Elf64_Sym_L> dynsyms;
     std::vector<std::pair<std::string, uint64_t>> exported_funcs;
+    std::vector<DefinedFunctionRange> cxxabi_runtime_anchors;
+    std::unordered_set<std::string> defined_export_seen;
+    auto record_defined_symbol = [&](const std::string& symbol,
+                                     uint64_t value,
+                                     uint64_t size,
+                                     uint8_t info) {
+        if (symbol.empty()) return;
+        if (defined_export_seen.insert(symbol).second) {
+            r.defined_exports.push_back(symbol);
+        }
+        if ((info & 0x0fU) == STT_FUNC_VAL && size > 0 &&
+            value <= UINT64_MAX - size) {
+            if (is_known_non_vm_candidate_function(symbol)) {
+                r.defined_function_ranges.push_back({symbol, value, size});
+            }
+            if (is_cxxabi_runtime_anchor_function(symbol)) {
+                cxxabi_runtime_anchors.push_back({symbol, value, size});
+            }
+        }
+    };
 
     for (size_t i = 0; i < shdrs.size(); ++i) {
         const auto &sh = shdrs[i];
-        std::string sec_name = (i < r.sections.size() ? r.sections[i].name : "");
-
-        if (sec_name == ".dynstr" && sh.sh_offset + sh.sh_size <= work_buf.size()) {
-            dynstr.assign(work_buf.begin() + sh.sh_offset,
-                          work_buf.begin() + sh.sh_offset + sh.sh_size);
+        if (sh.sh_type != SHT_DYNSYM_VAL ||
+            sh.sh_entsize != sizeof(Elf64_Sym_L) ||
+            !valid_file_range(sh.sh_offset, sh.sh_size, work_buf.size())) {
+            continue;
         }
+        size_t cnt = static_cast<size_t>(sh.sh_size / sh.sh_entsize);
+        dynsyms.resize(cnt);
+        std::memcpy(dynsyms.data(),
+                    work_buf.data() + sh.sh_offset,
+                    cnt * sizeof(Elf64_Sym_L));
 
-        if (sh.sh_type == SHT_DYNSYM_VAL &&
-            sh.sh_entsize == sizeof(Elf64_Sym_L) &&
-            sh.sh_offset + sh.sh_size <= work_buf.size()) {
-            size_t cnt = static_cast<size_t>(sh.sh_size / sh.sh_entsize);
-            dynsyms.resize(cnt);
-            std::memcpy(dynsyms.data(),
-                        work_buf.data() + sh.sh_offset,
-                        cnt * sizeof(Elf64_Sym_L));
+        // ELF defines the matching string table through sh_link.  Section
+        // names are optional and frequently removed by protectors.
+        if (sh.sh_link < shdrs.size()) {
+            const auto& linked = shdrs[sh.sh_link];
+            if (valid_file_range(linked.sh_offset, linked.sh_size, work_buf.size())) {
+                const size_t begin = static_cast<size_t>(linked.sh_offset);
+                const size_t end = begin + static_cast<size_t>(linked.sh_size);
+                dynstr.assign(work_buf.begin() + begin, work_buf.begin() + end);
+            }
         }
+        if (dynstr.empty()) {
+            for (size_t string_index = 0; string_index < shdrs.size(); ++string_index) {
+                if (string_index >= r.sections.size() ||
+                    r.sections[string_index].name != ".dynstr") continue;
+                const auto& fallback = shdrs[string_index];
+                if (!valid_file_range(fallback.sh_offset, fallback.sh_size,
+                                      work_buf.size())) continue;
+                const size_t begin = static_cast<size_t>(fallback.sh_offset);
+                const size_t end = begin + static_cast<size_t>(fallback.sh_size);
+                dynstr.assign(work_buf.begin() + begin, work_buf.begin() + end);
+                break;
+            }
+        }
+        break;
     }
 
     for (const auto &sym : dynsyms) {
@@ -997,6 +1216,7 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
             r.imports.push_back(sname);
         } else {
             r.exported_dynsym_count++;
+            record_defined_symbol(sname, sym.st_value, sym.st_size, sym.st_info);
 
             if (sym.st_value != 0) {
                 if (sname == "JNI_OnLoad" ||
@@ -1012,7 +1232,91 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
             }
         }
     }
+
+    std::unordered_set<std::string> import_seen;
+    std::vector<std::string> merged_imports;
+    merged_imports.reserve(r.imports.size() + dynamic_info.imports.size());
+    auto merge_import = [&](const std::string& symbol) {
+        if (!symbol.empty() && import_seen.insert(symbol).second) {
+            merged_imports.push_back(symbol);
+        }
+    };
+    for (const auto& symbol : r.imports) merge_import(symbol);
+    if (dynamic_info.valid) {
+        r.needed_libraries = dynamic_info.needed_libraries;
+        for (const auto& symbol : dynamic_info.imports) merge_import(symbol);
+        r.exported_dynsym_count = std::max(r.exported_dynsym_count,
+                                           dynamic_info.exported_symbol_count);
+        std::set<std::pair<std::string, uint64_t>> exported_seen(
+            exported_funcs.begin(), exported_funcs.end());
+        for (const auto& symbol : dynamic_info.symbols) {
+            if (symbol.undefined() || symbol.value == 0 || symbol.name.empty()) continue;
+            const std::string& sname = symbol.name;
+            record_defined_symbol(sname, symbol.value, symbol.size, symbol.info);
+            const bool interesting = sname == "JNI_OnLoad" ||
+                sname.rfind("Java_", 0) == 0 ||
+                sname.find("init") != std::string::npos ||
+                sname.find("Init") != std::string::npos ||
+                sname.find("load") != std::string::npos ||
+                sname.find("Load") != std::string::npos ||
+                sname.find("register") != std::string::npos ||
+                sname.find("Register") != std::string::npos;
+            if (interesting && exported_seen.insert({sname, symbol.value}).second) {
+                exported_funcs.push_back({sname, symbol.value});
+            }
+        }
+    }
+    r.imports = std::move(merged_imports);
+    std::sort(r.needed_libraries.begin(), r.needed_libraries.end());
+    r.needed_libraries.erase(
+        std::unique(r.needed_libraries.begin(), r.needed_libraries.end()),
+        r.needed_libraries.end());
+    std::sort(r.defined_exports.begin(), r.defined_exports.end());
+    if (cxxabi_runtime_anchors.size() >= 8) {
+        uint64_t runtime_begin = UINT64_MAX;
+        uint64_t runtime_end = 0;
+        for (const auto& anchor : cxxabi_runtime_anchors) {
+            runtime_begin = std::min(runtime_begin, anchor.address);
+            runtime_end = std::max(runtime_end, anchor.address + anchor.size);
+        }
+        constexpr uint64_t kMaxEmbeddedRuntimeSpan = 512ULL * 1024ULL;
+        if (runtime_begin < runtime_end &&
+            runtime_end - runtime_begin <= kMaxEmbeddedRuntimeSpan) {
+            r.embedded_cxxabi_runtime = true;
+            r.defined_function_ranges.push_back({
+                "embedded C++ ABI/demangler runtime",
+                runtime_begin,
+                runtime_end - runtime_begin
+            });
+            r.reasons.push_back(
+                "embedded C++ ABI runtime range excluded from VMP candidates");
+        }
+    }
+    std::sort(r.defined_function_ranges.begin(), r.defined_function_ranges.end(),
+        [](const DefinedFunctionRange& lhs, const DefinedFunctionRange& rhs) {
+            if (lhs.address != rhs.address) return lhs.address < rhs.address;
+            if (lhs.size != rhs.size) return lhs.size < rhs.size;
+            return lhs.name < rhs.name;
+        });
+    r.defined_function_ranges.erase(
+        std::unique(r.defined_function_ranges.begin(), r.defined_function_ranges.end(),
+            [](const DefinedFunctionRange& lhs, const DefinedFunctionRange& rhs) {
+                return lhs.address == rhs.address && lhs.size == rhs.size &&
+                       lhs.name == rhs.name;
+            }),
+        r.defined_function_ranges.end());
     r.import_count = r.imports.size();
+
+    RuntimeEvidence semantic_runtime =
+        detect_known_vm_or_branch_runtime(so_basename, work_buf, r.imports);
+    if (semantic_runtime.present()) {
+        r.known_runtime_framework = true;
+        r.known_vm_runtime = semantic_runtime.confirmed();
+        r.known_runtime_name = semantic_runtime.family;
+        r.runtime_evidence_classes = semantic_runtime.evidence_classes();
+        r.runtime_raw_identity_hits = semantic_runtime.raw_hits;
+        r.runtime_import_api_hits = semantic_runtime.import_hits;
+    }
 
     const uint8_t *text_ptr = nullptr;
     size_t text_size = 0;
@@ -1020,11 +1324,11 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
 
     for (const auto &sec : r.sections) {
         if (sec.name == ".text" &&
-            sec.offset + sec.size <= work_buf.size() &&
+            valid_file_range(sec.offset, sec.size, work_buf.size()) &&
             sec.size >= 4) {
             text_ptr = work_buf.data() + sec.offset;
             text_size = static_cast<size_t>(sec.size);
-            text_base_addr = 0;
+            text_base_addr = sec.address;
             break;
         }
     }
@@ -1033,7 +1337,7 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
         for (const auto &seg : r.segments) {
             if (seg.type == PT_LOAD_VAL &&
                 (seg.flags & PF_X_VAL) &&
-                seg.offset + seg.filesz <= work_buf.size() &&
+                valid_file_range(seg.offset, seg.filesz, work_buf.size()) &&
                 seg.filesz >= 4) {
                 text_ptr = work_buf.data() + seg.offset;
                 text_size = static_cast<size_t>(seg.filesz);
@@ -1053,10 +1357,16 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
                 add_entry_preview(r, engine, work_buf, "ELF入口", eh.e_entry, 12);
             }
 
+            if (dynamic_info.valid && dynamic_info.has_init &&
+                dynamic_info.init_va != 0) {
+                add_entry_preview(r, engine, work_buf, "DT_INIT",
+                                  dynamic_info.init_va, 12);
+            }
+
             if (r.has_init_array &&
-                r.init_array_offset < work_buf.size() &&
                 r.init_array_size >= 8 &&
-                r.init_array_offset + r.init_array_size <= work_buf.size()) {
+                valid_file_range(r.init_array_offset, r.init_array_size,
+                                 work_buf.size())) {
 
                 size_t cnt = static_cast<size_t>(r.init_array_size / 8);
                 size_t limit = std::min<size_t>(cnt, 8);
@@ -1087,15 +1397,41 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
     static const std::unordered_set<std::string> suspicious_loader_imports = {
         "dlopen", "android_dlopen_ext", "dlsym",
         "mmap", "mprotect", "munmap",
+        "mremap", "memfd_create",
         "memcpy", "memmove", "memset",
         "pthread_create", "ptrace",
+        "prctl", "process_vm_readv", "process_vm_writev",
         "open", "openat", "read", "pread64", "fstat", "lseek",
-        "syscall", "__system_property_get", "sigaction", "sigprocmask"
+        "syscall", "__system_property_get", "dl_iterate_phdr", "sigaction", "sigprocmask"
     };
 
     size_t loader_hit = 0;
     for (const auto &imp : r.imports) {
         if (suspicious_loader_imports.count(imp)) loader_hit++;
+    }
+
+    size_t pine_name_hits = count_buffer_needles_icase(work_buf, {
+        "_ZN4pine", "top.canyie.pine", "pine::", "PineEnhances", "PineConfig"
+    });
+    size_t pine_art_hits = count_buffer_needles_icase(work_buf, {
+        "ElfImage", "ArtMethod", "Jit", "RegisterNatives", "trampoline", "entrypoint"
+    });
+    size_t custom_linker_marker_hits = count_buffer_needles_icase(work_buf, {
+        "linker",  "customlinker", "shelllinker", "protectlinker"
+    });
+    size_t vmp_metadata_hits = count_buffer_needles_icase(work_buf, {
+        "Target VMP2 metadata", "VMP2 metadata", "VMP metadata"
+    });
+    const bool protection_interpreter_marker =
+        count_buffer_needles_icase(work_buf, {"JavaVMP"}) >= 1 &&
+        count_buffer_needles_icase(work_buf, {"interpreter_wrap_"}) >= 1;
+    if (protection_interpreter_marker) {
+        ++vmp_metadata_hits;
+        r.reasons.push_back("protection VM interpreter marker cluster");
+    }
+    if (pine_name_hits >= 1 && pine_art_hits >= 1) {
+        r.known_hook_framework = true;
+        r.known_framework_name = "Pine";
     }
 
     double low_string_density = 0.0;
@@ -1126,6 +1462,49 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
     if (r.text_size > 0 && r.analyzed_file_size > 256 * 1024 && r.text_size < 32 * 1024) {
         tiny_text_big_file = 1.0;
     }
+    if (r.sections.empty()) {
+        for (const auto& seg : r.segments) {
+            if (seg.type != PT_LOAD_VAL || (seg.flags & PF_X_VAL) != 0 ||
+                seg.filesz < 64 * 1024 ||
+                !valid_file_range(seg.offset, seg.filesz, work_buf.size())) {
+                continue;
+            }
+            const double entropy = shannon_entropy(
+                work_buf.data() + static_cast<size_t>(seg.offset),
+                static_cast<size_t>(seg.filesz));
+            r.max_section_entropy = std::max(r.max_section_entropy, entropy);
+            if (entropy >= 7.4) huge_entropy_blob = 1.0;
+        }
+    }
+
+    size_t init_array_entry_count = static_cast<size_t>(r.init_array_size / 8);
+    double heavy_init_array = 0.0;
+    if (init_array_entry_count >= 20) heavy_init_array = 1.0;
+    else if (init_array_entry_count >= 8) heavy_init_array = 0.5;
+
+    double zip_container_suspicion = r.is_zip_container ? 1.0 : 0.0;
+    double asset_path_suspicion = loaded_from_assets ? 1.0 : 0.0;
+
+    size_t linker_elf_string_hits = count_buffer_needles_icase(work_buf, {
+        "PT_LOAD", "PT_DYNAMIC", "DT_NEEDED", "DT_INIT", "DT_INIT_ARRAY",
+        "DT_FINI", "DT_FINI_ARRAY", "DT_RELA", "DT_RELASZ", "DT_JMPREL",
+        "DT_PLTREL", "DT_SYMTAB", "DT_STRTAB", "DT_GNU_HASH", "DT_HASH",
+        "Elf64_Ehdr", "Elf64_Phdr", "Elf64_Dyn"
+    });
+    size_t linker_internal_hits = count_buffer_needles_icase(work_buf, {
+        "linker64", "/system/bin/linker", "/apex/com.android.runtime/bin/linker",
+        "soinfo", "solist", "android_namespace", "__loader_dlopen",
+        "call_constructors", "find_library", "link_image"
+    });
+    size_t map_import_hits = count_import_name_hits(r.imports, {
+        "mmap", "mprotect", "munmap", "mremap", "memfd_create"
+    });
+    size_t file_io_import_hits = count_import_name_hits(r.imports, {
+        "open", "openat", "read", "pread64", "lseek", "fstat", "close"
+    });
+    size_t dynlink_import_hits = count_import_name_hits(r.imports, {
+        "dlopen", "android_dlopen_ext", "dlsym", "dl_iterate_phdr"
+    });
 
     double suspicious_section_name = 0.0;
     static const std::vector<std::string> sec_needles = {
@@ -1133,16 +1512,58 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
     };
     if (contains_any_icase(section_names, sec_needles)) suspicious_section_name = 1.0;
 
+    bool linker_api_profile =
+        map_import_hits >= 2 &&
+        (file_io_import_hits >= 2 || dynlink_import_hits >= 2);
+    bool linker_parser_profile =
+        linker_elf_string_hits >= 3 || linker_internal_hits >= 1 || custom_linker_marker_hits >= 1;
+    bool protected_payload_profile =
+        huge_entropy_blob > 0.5 ||
+        tiny_text_big_file > 0.5 ||
+        low_string_density > 0.5 ||
+        r.entry_in_writable_segment ||
+        r.is_zip_container ||
+        loaded_from_assets;
+
+    r.custom_linker_score = clamp01(
+        std::min(0.40, custom_linker_marker_hits * 0.34) +
+        std::min(0.24, linker_elf_string_hits * 0.045) +
+        std::min(0.18, linker_internal_hits * 0.09) +
+        std::min(0.22, map_import_hits * 0.055) +
+        std::min(0.14, file_io_import_hits * 0.035) +
+        std::min(0.14, dynlink_import_hits * 0.045) +
+        (protected_payload_profile ? 0.10 : 0.0) +
+        (huge_entropy_blob > 0.5 ? 0.08 : 0.0) +
+        (tiny_text_big_file > 0.5 ? 0.06 : 0.0) +
+        (loaded_from_assets ? 0.05 : 0.0) +
+        (r.is_zip_container ? 0.05 : 0.0)
+    );
+
+    r.possible_custom_linker =
+        (r.custom_linker_score >= 0.62 &&
+         linker_api_profile &&
+         (linker_parser_profile || protected_payload_profile)) ||
+        (custom_linker_marker_hits >= 1 && linker_api_profile);
+
     r.packer_score =
-        std::min(0.45, loader_hit * 0.08) +
-        (r.rwx_segment ? 0.20 : 0.0) +
-        (r.has_init_array ? 0.08 : 0.0) +
+        std::min(0.50, loader_hit * 0.08) +
+        (r.rwx_segment ? 0.22 : 0.0) +
+        (r.entry_in_writable_segment ? 0.18 : 0.0) +
+        (r.has_init_array ? 0.05 : 0.0) +
+        (heavy_init_array * 0.12) +
         (r.has_jni_onload_string ? 0.05 : 0.0) +
         (huge_entropy_blob * 0.22) +
         (tiny_text_big_file * 0.18) +
-        (low_string_density * 0.08);
+        (low_string_density * 0.08) +
+        (zip_container_suspicion * 0.15) +
+        (asset_path_suspicion * 0.12);
 
     r.packer_score = clamp01(r.packer_score);
+    if (r.possible_custom_linker) {
+        r.packer_score = std::max(r.packer_score, 0.72);
+    } else if (r.custom_linker_score >= 0.50) {
+        r.packer_score = clamp01(r.packer_score + 0.08);
+    }
 
     double branch_ratio = r.a64.branch_ratio();
     double indirect_branch_ratio = r.a64.indirect_branch_ratio();
@@ -1177,80 +1598,446 @@ static AnalysisResult analyze_so(const std::string &name, const std::vector<uint
             ((r.max_section_entropy > 7.5) ? 0.10 : 0.0)
         );
 
+    VmpAnalysisContext vmp_context;
+    vmp_context.import_count = r.import_count;
+    vmp_context.has_init_array = r.has_init_array;
+    vmp_context.has_large_entropy_blob = huge_entropy_blob > 0.5;
+    vmp_context.code_obscured_by_packing =
+        (tiny_text_big_file > 0.5 && huge_entropy_blob > 0.5) ||
+        executable_regions.empty();
+    // Only semantic VM/interpreter runtimes are a VMP alternative. Generic
+    // libraries such as logging, image or layout frameworks must not veto a
+    // genuine dispatcher merely because their filename is familiar.
+    vmp_context.known_runtime = r.known_vm_runtime;
+    vmp_context.known_non_vm_framework =
+        r.known_runtime_framework && !r.known_vm_runtime;
+    vmp_context.runtime_evidence_classes = r.runtime_evidence_classes;
+    vmp_context.known_runtime_name = r.known_runtime_name;
+    vmp_context.vmp_metadata_marker = vmp_metadata_hits >= 1;
+    vmp_context.custom_linker_marker = custom_linker_marker_hits >= 1;
+    vmp_context.custom_linker_likely = r.possible_custom_linker;
+    vmp_context.control_flow_obfuscation_likely =
+        obf_arith_ratio > 0.28 && r.avg_exec_entropy > 6.8 &&
+        (r.packer_score >= 0.55 || r.ollvm_score >= 0.40 ||
+         r.strong_obf_score >= 0.55);
+
+    for (const auto& sec : r.sections) {
+        if ((sec.flags & SHF_EXECINSTR_VAL) == 0 || sec.size == 0) continue;
+        if (sec.name == ".plt" || sec.name == ".plt.got" ||
+            sec.name == ".iplt" || sec.name == ".init" || sec.name == ".fini") {
+            if (sec.address <= UINT64_MAX - sec.size) {
+                vmp_context.excluded_thunk_ranges.push_back(
+                    AddressRange{sec.address, sec.address + sec.size});
+            }
+        }
+    }
+    for (const auto& function : r.defined_function_ranges) {
+        const uint64_t end = function.address + function.size;
+        const bool within_executable_region = std::any_of(
+            executable_regions.begin(), executable_regions.end(),
+            [&](const ExecutableRegionView& region) {
+                if (region.virtual_address > UINT64_MAX - region.size) return false;
+                const uint64_t region_end = region.virtual_address + region.size;
+                return function.address >= region.virtual_address && end <= region_end;
+            });
+        if (within_executable_region) {
+            vmp_context.excluded_thunk_ranges.push_back(
+                AddressRange{function.address, end});
+        }
+    }
+    if (dynamic_info.valid && !dynamic_info.jump_slot_vas.empty()) {
+        auto dynamic_plt_ranges = find_dynamic_plt_branch_ranges(
+            executable_regions, dynamic_info.jump_slot_vas);
+        vmp_context.excluded_thunk_ranges.insert(
+            vmp_context.excluded_thunk_ranges.end(),
+            dynamic_plt_ranges.begin(), dynamic_plt_ranges.end());
+    }
+
+    r.vmp = analyze_vmp_regions(executable_regions, vmp_context);
+    if (r.vmp.possible) {
+        r.reasons.push_back("possible vmp dispatcher/handler loop");
+    } else if (r.vmp.outcome == "VM_LIKE_INTERPRETER") {
+        r.reasons.push_back("vmp-like branches explained by known runtime framework");
+    } else if (r.vmp.outcome == "INCONCLUSIVE_PACKED") {
+        r.reasons.push_back("vmp observability blocked by packing");
+    } else if (r.vmp.outcome == "SUSPICIOUS_VM_STRUCTURE") {
+        r.reasons.push_back("vmp-like dispatch signals");
+    }
+
+    r.strong_obf_score = clamp01(
+        r.strong_obf_score +
+        (r.vmp.possible ? 0.14 : r.vmp.structure_score * 0.06)
+    );
+    bool plain_known_runtime =
+        r.known_runtime_framework &&
+        r.vmp.outcome == "VM_LIKE_INTERPRETER" &&
+        r.vmp.protection_intent_score < 0.50 &&
+        !r.vmp.possible &&
+        !r.possible_custom_linker &&
+        custom_linker_marker_hits == 0 &&
+        !r.is_zip_container &&
+        !r.rwx_segment &&
+        !r.entry_in_writable_segment &&
+        huge_entropy_blob <= 0.5 &&
+        tiny_text_big_file <= 0.5;
+    bool plain_known_hook =
+        r.known_hook_framework &&
+        !r.vmp.possible &&
+        !r.possible_custom_linker &&
+        custom_linker_marker_hits == 0 &&
+        !r.is_zip_container &&
+        !r.rwx_segment &&
+        !r.entry_in_writable_segment &&
+        huge_entropy_blob <= 0.5 &&
+        tiny_text_big_file <= 0.5;
+    if (plain_known_runtime) {
+        r.packer_score = std::min(r.packer_score, 0.44);
+        r.ollvm_score = std::min(r.ollvm_score, 0.49);
+        r.strong_obf_score = std::min(r.strong_obf_score, 0.49);
+    }
+    if (plain_known_hook) {
+        r.packer_score = std::min(r.packer_score, 0.44);
+        r.ollvm_score = std::min(r.ollvm_score, 0.49);
+        r.strong_obf_score = std::min(r.strong_obf_score, 0.49);
+    }
+
+    if (r.known_hook_framework) {
+        r.reasons.push_back("known hook framework: " + r.known_framework_name);
+    }
+    if (r.known_runtime_framework) {
+        r.reasons.push_back("known runtime framework: " + r.known_runtime_name);
+    }
+    bool report_linker_profile = r.possible_custom_linker || r.custom_linker_score >= 0.50;
+    if (custom_linker_marker_hits >= 1) {
+        r.reasons.push_back("custom linker marker string");
+    }
+    if (r.possible_custom_linker) {
+        r.reasons.push_back("custom linker loader profile");
+    } else if (r.custom_linker_score >= 0.50) {
+        r.reasons.push_back("custom linker-like loader profile");
+    }
+    if (report_linker_profile && linker_parser_profile) r.reasons.push_back("ELF dynamic loader strings present");
+    if (report_linker_profile && linker_api_profile) r.reasons.push_back("manual mmap/mprotect loader api cluster");
+    if (report_linker_profile && protected_payload_profile) {
+        r.reasons.push_back("protected payload/container signal");
+    }
     if (r.stripped) r.reasons.push_back("missing .symtab / stripped");
     if (r.rwx_segment) r.reasons.push_back("found RWX PT_LOAD segment");
+    if (r.entry_in_writable_segment) r.reasons.push_back("entry point in writable segment");
     if (loader_hit > 0) r.reasons.push_back("suspicious loader imports hit=" + std::to_string(loader_hit));
     if (huge_entropy_blob > 0.5) r.reasons.push_back("large high-entropy blob detected");
     if (tiny_text_big_file > 0.5) r.reasons.push_back("tiny .text but large file");
+    if (heavy_init_array > 0.5) r.reasons.push_back("large init_array entry count");
     if (low_string_density > 0.5) r.reasons.push_back("very low printable string density");
     if (r.avg_exec_entropy > 6.8) r.reasons.push_back("high executable segment entropy");
     if (branch_ratio > 0.18) r.reasons.push_back("high branch density in AArch64 text");
     if (indirect_branch_ratio > 0.015) r.reasons.push_back("high indirect branch density");
     if (obf_arith_ratio > 0.28) r.reasons.push_back("high arithmetic/logical opcode density");
 
-    if (r.packer_score >= 0.70) {
+    if (r.possible_custom_linker && r.vmp.possible) {
+        r.final_label = "POSSIBLE_CUSTOM_LINKER_VMP";
+    } else if (r.possible_custom_linker) {
+        r.final_label = "POSSIBLE_CUSTOM_LINKER";
+    } else if (plain_known_hook) {
+        r.final_label = "KNOWN_HOOK_FRAMEWORK";
+    } else if (r.packer_score >= 0.68 ||
+        (r.packer_score >= 0.62 && r.strong_obf_score >= 0.58)) {
         r.final_label = "POSSIBLE_PACKER";
-    } else if (r.strong_obf_score >= 0.72 && r.ollvm_score >= 0.55) {
+    } else if (r.vmp.possible) {
+        r.final_label = "POSSIBLE_VMP_OR_STRONG_OBF";
+    } else if (r.strong_obf_score >= 0.70 && r.ollvm_score >= 0.52) {
         r.final_label = "POSSIBLE_OLLVM_OR_STRONG_OBF";
-    } else if (r.strong_obf_score >= 0.70) {
+    } else if (r.strong_obf_score >= 0.68) {
         r.final_label = "STRONG_OBFUSCATION";
     } else if (r.ollvm_score >= 0.60) {
         r.final_label = "POSSIBLE_OLLVM";
     } else {
         r.final_label = "NORMAL_OR_LIGHT_OBF";
     }
-    if (is_high_risk_result(r) && text_ptr && text_size >= 128) {
-        r.vmp = analyze_vmp_deep(r, work_buf, text_ptr, text_size, text_base_addr);
-        if (r.vmp.possible) {
-            r.reasons.push_back("possible vmp dispatcher/handler loop");
-        }
-    }
     return r;
+}
+
+static void link_vmp_protected_clients(std::vector<AnalysisResult>& results) {
+    std::vector<obfuscan::vmp_linkage::ProviderView> providers;
+    providers.reserve(results.size());
+    for (const auto& result : results) {
+        providers.push_back({
+            result.so_name,
+            result.defined_exports,
+            result.vmp.outcome == "LIKELY_VMP" && result.vmp.confidence == "HIGH",
+            is_high_risk_result(result)
+        });
+    }
+
+    for (auto& client : results) {
+        // A library with its own high-confidence dispatcher remains a provider;
+        // dependency evidence must not replace stronger local evidence.
+        if (client.vmp.outcome == "LIKELY_VMP") continue;
+        const auto evidence = obfuscan::vmp_linkage::find_protected_provider(
+            client.needed_libraries, client.imports, providers);
+        if (!evidence.matched()) continue;
+
+        client.vmp_protected_client = true;
+        client.vmp_provider_so = evidence.provider_so;
+        client.vmp_needed_library = evidence.needed_library;
+        client.vmp_shared_symbols = evidence.shared_symbols;
+        client.final_label = "VMP_PROTECTED_CLIENT";
+
+        // This is a dependency relationship, not proof that the client itself
+        // owns a dispatcher.  Replace local heuristic candidates with a clean
+        // relationship outcome and expose the graph evidence separately.
+        VmpDeepResult linked;
+        linked.analyzed = true;
+        linked.observable = client.vmp.observable;
+        linked.coverage = client.vmp.coverage;
+        linked.outcome = "VMP_PROTECTED_CLIENT";
+        linked.confidence = "HIGH";
+        linked.profile = "DEPENDENCY_LINKED";
+        client.vmp = std::move(linked);
+
+        client.reasons.erase(
+            std::remove_if(client.reasons.begin(), client.reasons.end(),
+                [](const std::string& reason) {
+                    return reason == "possible vmp dispatcher/handler loop" ||
+                           reason == "vmp-like dispatch signals";
+                }),
+            client.reasons.end());
+        client.reasons.push_back("imports protected VMP provider symbols");
+    }
 }
 
 // =========================
 // APK 读取
 // =========================
 
-struct ApkSoEntry {
-    std::string name_in_apk;
-    std::vector<uint8_t> data;
+struct ApkInputPath {
+    std::string utf8;
+#ifdef _WIN32
+    std::wstring native;
+#endif
 };
 
-static std::vector<ApkSoEntry> load_arm64_sos_from_apk(const std::string &apk_path) {
-    std::vector<ApkSoEntry> out;
+struct ApkScanReport {
+    std::vector<AnalysisResult> results;
+    std::vector<ScanDiagnostic> diagnostics;
+    std::string status = "OK";
+    uint64_t apk_file_bytes = 0;
+    uint64_t archive_entry_count = 0;
+    uint64_t relevant_so_count = 0;
+    uint64_t analyzed_so_count = 0;
+    uint64_t skipped_so_count = 0;
+    uint64_t declared_relevant_uncompressed_bytes = 0;
+    uint64_t accepted_relevant_uncompressed_bytes = 0;
+    uint64_t zip_metadata_peak_bytes = 0;
+    uint64_t suppressed_diagnostic_count = 0;
+};
 
-    mz_zip_archive zip{};
-    if (!mz_zip_reader_init_file(&zip, apk_path.c_str(), 0)) {
-        std::cerr << "[-] open apk failed: " << apk_path << "\n";
-        return out;
+struct ApkSoCandidate {
+    mz_uint zip_index = 0;
+    std::string name;
+    uint64_t compressed_bytes = 0;
+    uint64_t uncompressed_bytes = 0;
+    bool encrypted = false;
+    bool supported = false;
+};
+
+static void add_report_diagnostic(ApkScanReport& report,
+                                  const std::string& severity,
+                                  const std::string& code,
+                                  const std::string& entry = std::string(),
+                                  const std::string& detail = std::string(),
+                                  uint64_t entry_index = 0,
+                                  uint64_t compressed_bytes = 0,
+                                  uint64_t uncompressed_bytes = 0,
+                                  bool has_entry_index = false) {
+    record_scan_diagnostic(
+        report.diagnostics, report.suppressed_diagnostic_count,
+        ScanDiagnostic{severity, code, entry, detail, entry_index,
+                       compressed_bytes, uncompressed_bytes, has_entry_index});
+}
+
+static ApkScanReport analyze_arm64_sos_from_apk(const ApkInputPath &apk_path) {
+    ApkScanReport report;
+
+    std::error_code file_size_error;
+#ifdef _WIN32
+    const std::filesystem::path filesystem_path(apk_path.native);
+#else
+    const std::filesystem::path filesystem_path(apk_path.utf8);
+#endif
+    const std::uintmax_t file_size = std::filesystem::file_size(
+        filesystem_path, file_size_error);
+    if (!file_size_error) {
+        report.apk_file_bytes = static_cast<uint64_t>(
+            std::min<std::uintmax_t>(file_size, std::numeric_limits<uint64_t>::max()));
+        if (file_size > obfuscan::ApkScanLimits::kMaxApkBytes) {
+            report.status = "REJECTED";
+            add_report_diagnostic(report, "error", "APK_FILE_SIZE_LIMIT", apk_path.utf8,
+                                  std::to_string(file_size));
+            return report;
+        }
     }
 
+    MinizAllocationBudget allocation_budget{
+        static_cast<size_t>(obfuscan::ApkScanLimits::kMaxZipMetadataBytes)};
+    mz_zip_archive zip{};
+    configure_bounded_miniz_allocator(zip, allocation_budget);
+    ZipReaderScope scope{&zip, nullptr, false};
+#ifdef _WIN32
+    MZ_FILE *apk_file = _wfopen(apk_path.native.c_str(), L"rb");
+    scope.external_file = apk_file;
+    const bool input_file_opened = apk_file != nullptr;
+    const bool zip_opened = apk_file && mz_zip_reader_init_cfile(
+        &zip, apk_file, 0, MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY);
+#else
+    const bool input_file_opened = true;
+    const bool zip_opened = mz_zip_reader_init_file(
+        &zip, apk_path.utf8.c_str(), MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY);
+#endif
+    if (!zip_opened) {
+        report.status = allocation_budget.limit_hit ? "REJECTED" : "ERROR";
+        add_report_diagnostic(
+            report, "error",
+            allocation_budget.limit_hit ? "APK_ZIP_METADATA_LIMIT" : "APK_OPEN_FAILED",
+            apk_path.utf8,
+            input_file_opened ? miniz_error_detail(zip) : "unable to open input file");
+        report.zip_metadata_peak_bytes = allocation_budget.peak_bytes;
+        return report;
+    }
+    scope.initialized = true;
+
     mz_uint file_count = mz_zip_reader_get_num_files(&zip);
+    report.archive_entry_count = file_count;
+    if (file_count > obfuscan::ApkScanLimits::kMaxZipEntries) {
+        report.status = "REJECTED";
+        add_report_diagnostic(report, "error", "APK_ENTRY_LIMIT", apk_path.utf8,
+                              std::to_string(file_count));
+        report.zip_metadata_peak_bytes = allocation_budget.peak_bytes;
+        return report;
+    }
+
+    std::vector<ApkSoCandidate> candidates;
+    candidates.reserve(static_cast<size_t>(
+        obfuscan::ApkScanLimits::kMaxCandidateSoEntries));
     for (mz_uint i = 0; i < file_count; ++i) {
         mz_zip_archive_file_stat st{};
-        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) {
+            add_report_diagnostic(report, "warning", "ZIP_ENTRY_STAT_FAILED", "",
+                                  miniz_error_detail(zip), i, 0, 0, true);
+            continue;
+        }
         if (st.m_is_directory) continue;
 
-        std::string name = st.m_filename ? st.m_filename : "";
+        std::string name = st.m_filename;
         if (!starts_with(name, "lib/arm64-v8a/") && !starts_with(name, "assets/")) continue;
         if (!ends_with(name, ".so")) continue;
 
-        size_t out_size = 0;
-        void *p = mz_zip_reader_extract_to_heap(&zip, i, &out_size, 0);
-        if (!p || out_size == 0) continue;
-
-        ApkSoEntry e;
-        e.name_in_apk = name;
-        e.data.resize(out_size);
-        std::memcpy(e.data.data(), p, out_size);
-        mz_free(p);
-
-        out.emplace_back(std::move(e));
+        ++report.relevant_so_count;
+        report.declared_relevant_uncompressed_bytes = obfuscan::saturating_add_u64(
+            report.declared_relevant_uncompressed_bytes, st.m_uncomp_size);
+        if (candidates.size() < obfuscan::ApkScanLimits::kMaxCandidateSoEntries) {
+            candidates.push_back({i, std::move(name), st.m_comp_size, st.m_uncomp_size,
+                                  st.m_is_encrypted != 0, st.m_is_supported != 0});
+        }
     }
 
-    mz_zip_reader_end(&zip);
-    return out;
+    if (report.relevant_so_count > obfuscan::ApkScanLimits::kMaxCandidateSoEntries) {
+        report.status = "REJECTED";
+        report.skipped_so_count = report.relevant_so_count;
+        add_report_diagnostic(report, "error", "SO_CANDIDATE_LIMIT", apk_path.utf8,
+                              std::to_string(report.relevant_so_count));
+        report.zip_metadata_peak_bytes = allocation_budget.peak_bytes;
+        return report;
+    }
+
+    const obfuscan::ZipPayloadPolicy policy{
+        obfuscan::ApkScanLimits::kMaxSingleSoBytes,
+        obfuscan::ApkScanLimits::kMaxCompressionRatio,
+        obfuscan::ApkScanLimits::kCompressionRatioFloorBytes,
+    };
+
+    for (const auto& candidate : candidates) {
+        const obfuscan::ZipPayloadDecision decision = obfuscan::evaluate_zip_payload(
+            {candidate.compressed_bytes, candidate.uncompressed_bytes,
+             candidate.encrypted, candidate.supported},
+            policy);
+        if (decision != obfuscan::ZipPayloadDecision::kAllow) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(
+                report, "warning",
+                "SO_" + std::string(obfuscan::zip_payload_decision_code(decision)),
+                candidate.name, "", candidate.zip_index, candidate.compressed_bytes,
+                candidate.uncompressed_bytes, true);
+            continue;
+        }
+
+        if (!obfuscan::fits_cumulative_budget(
+                report.accepted_relevant_uncompressed_bytes,
+                candidate.uncompressed_bytes,
+                obfuscan::ApkScanLimits::kMaxTotalRelevantSoBytes)) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_TOTAL_UNCOMPRESSED_LIMIT",
+                                  candidate.name, "", candidate.zip_index,
+                                  candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+            continue;
+        }
+        report.accepted_relevant_uncompressed_bytes += candidate.uncompressed_bytes;
+
+        std::vector<uint8_t> data;
+        try {
+            data.resize(static_cast<size_t>(candidate.uncompressed_bytes));
+        } catch (const std::bad_alloc&) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_ALLOCATION_FAILED",
+                                  candidate.name, "", candidate.zip_index,
+                                  candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+            continue;
+        }
+
+        if (!mz_zip_reader_extract_to_mem(&zip, candidate.zip_index,
+                                          data.data(), data.size(), 0)) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_EXTRACT_FAILED",
+                                  candidate.name, miniz_error_detail(zip),
+                                  candidate.zip_index, candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+            continue;
+        }
+
+        try {
+            report.results.emplace_back(analyze_so(
+                candidate.name, data, &report.diagnostics,
+                &report.suppressed_diagnostic_count));
+        } catch (const std::bad_alloc&) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_ANALYSIS_ALLOCATION_FAILED",
+                                  candidate.name, "", candidate.zip_index,
+                                  candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+        } catch (const std::exception& error) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_ANALYSIS_FAILED",
+                                  candidate.name, error.what(), candidate.zip_index,
+                                  candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+        } catch (...) {
+            ++report.skipped_so_count;
+            add_report_diagnostic(report, "warning", "SO_ANALYSIS_FAILED",
+                                  candidate.name, "unknown exception", candidate.zip_index,
+                                  candidate.compressed_bytes,
+                                  candidate.uncompressed_bytes, true);
+        }
+    }
+
+    report.analyzed_so_count = report.results.size();
+    link_vmp_protected_clients(report.results);
+    report.zip_metadata_peak_bytes = allocation_budget.peak_bytes;
+    if (!report.diagnostics.empty() || report.suppressed_diagnostic_count != 0) {
+        report.status = "PARTIAL";
+    }
+    return report;
 }
 
 // =========================
@@ -1268,7 +2055,12 @@ static void print_usage(const char *prog) {
 }
 
 static std::string label_to_zh(const std::string &label) {
+    if (label == "VMP_PROTECTED_CLIENT") return "VMP保护库关联客户端";
+    if (label == "POSSIBLE_CUSTOM_LINKER_VMP") return "疑似自定义Linker+VMP加固";
+    if (label == "POSSIBLE_CUSTOM_LINKER") return "疑似自定义Linker加固";
+    if (label == "KNOWN_HOOK_FRAMEWORK") return "Hook/Trampoline框架";
     if (label == "POSSIBLE_PACKER") return "疑似加壳";
+    if (label == "POSSIBLE_VMP_OR_STRONG_OBF") return "疑似 VMP/强混淆";
     if (label == "POSSIBLE_OLLVM_OR_STRONG_OBF") return "疑似强混淆/OLLVM";
     if (label == "STRONG_OBFUSCATION") return "疑似强混淆";
     if (label == "POSSIBLE_OLLVM") return "疑似 OLLVM";
@@ -1280,7 +2072,12 @@ static std::string label_to_zh(const std::string &label) {
 }
 
 static std::string label_to_en(const std::string &label) {
+    if (label == "VMP_PROTECTED_CLIENT") return "VMP-Protected Client";
+    if (label == "POSSIBLE_CUSTOM_LINKER_VMP") return "Possible Custom Linker + VMP Protection";
+    if (label == "POSSIBLE_CUSTOM_LINKER") return "Possible Custom Linker Packer";
+    if (label == "KNOWN_HOOK_FRAMEWORK") return "Hook/Trampoline Framework";
     if (label == "POSSIBLE_PACKER") return "Possible Packer";
+    if (label == "POSSIBLE_VMP_OR_STRONG_OBF") return "Possible VMP/Strong Obfuscation";
     if (label == "POSSIBLE_OLLVM_OR_STRONG_OBF") return "Possible OLLVM/Strong Obfuscation";
     if (label == "STRONG_OBFUSCATION") return "Strong Obfuscation";
     if (label == "POSSIBLE_OLLVM") return "Possible OLLVM";
@@ -1292,22 +2089,40 @@ static std::string label_to_en(const std::string &label) {
 }
 
 static std::string risk_level_zh(const AnalysisResult &r) {
-    if (r.packer_score >= 0.70 || r.strong_obf_score >= 0.72) return "高";
-    if (r.ollvm_score >= 0.50 || r.strong_obf_score >= 0.50) return "中";
+    if (is_high_risk_result(r)) return "高";
+    if (is_medium_risk_result(r)) return "中";
     return "低";
 }
 
 static std::string risk_level_en(const AnalysisResult &r) {
-    if (r.packer_score >= 0.70 || r.strong_obf_score >= 0.72) return "High";
-    if (r.ollvm_score >= 0.50 || r.strong_obf_score >= 0.50) return "Medium";
+    if (is_high_risk_result(r)) return "High";
+    if (is_medium_risk_result(r)) return "Medium";
     return "Low";
 }
 
 static std::string reason_to_zh(const std::string &reason) {
+    if (reason == "embedded C++ ABI runtime range excluded from VMP candidates") return "已识别并排除内嵌 C++ ABI/反修饰运行时代码区，避免把语法跳表误判为VMP";
+    if (reason == "protection VM interpreter marker cluster") return "同时发现JavaVMP与解释器包装器标记，作为保护型VM辅助证据";
+    if (reason == "imports protected VMP provider symbols") return "通过DT_NEEDED及共享符号确认调用VMP保护库";
+    if (reason == "loaded from assets path") return "位于 assets 路径，可能是运行时释放或加载的库";
     if (reason == "missing .symtab / stripped") return "已裁剪符号表";
     if (reason == "found RWX PT_LOAD segment") return "发现可读可写可执行段";
+    if (reason == "entry point in writable segment") return "ELF入口落在可写段";
     if (reason == "large high-entropy blob detected") return "存在大块高熵数据";
     if (reason == "tiny .text but large file") return "代码段很小但文件较大";
+    if (reason == "large init_array entry count") return ".init_array 初始化入口较多";
+    if (reason.rfind("known hook framework:", 0) == 0) return "识别到Hook/Trampoline框架";
+    if (reason.rfind("known runtime framework:", 0) == 0) return "识别到常见三方运行时/框架";
+    if (reason == "vmp-like branches explained by hook framework") return "VMP相似跳转由Hook/Trampoline框架解释，不按VMP处理";
+    if (reason == "vmp-like branches explained by known runtime framework") return "VMP相似跳转由常见运行时/框架解释，不按VMP处理";
+    if (reason == "vmp metadata marker present") return "存在VMP元数据标记";
+    if (reason == "custom linker with vmp-like dispatcher") return "自定义Linker样本中存在VMP分发相似窗口";
+    if (reason == "custom linker marker string") return "存在自定义Linker私有标记字符串";
+    if (reason == "custom linker loader profile") return "命中自定义Linker/Loader加固特征";
+    if (reason == "custom linker-like loader profile") return "存在部分自定义Linker/Loader特征";
+    if (reason == "ELF dynamic loader strings present") return "存在ELF动态装载/重定位相关字符串";
+    if (reason == "manual mmap/mprotect loader api cluster") return "存在手动映射/改权限/动态解析API组合";
+    if (reason == "protected payload/container signal") return "存在受保护payload或容器特征";
     if (reason == "very low printable string density") return "可见字符串很少";
     if (reason == "high executable segment entropy") return "可执行段熵较高";
     if (reason == "high branch density in AArch64 text") return "分支跳转密度高";
@@ -1319,15 +2134,34 @@ static std::string reason_to_zh(const std::string &reason) {
     if (reason.rfind("suspicious loader imports hit=", 0) == 0) {
         return "存在较多可疑加载器导入函数";
     }
+    if (reason == "vmp-like dispatch signals") return "存在一定 VMP 分发器相似特征";
     if (reason == "possible vmp dispatcher/handler loop") return "存在疑似VMP分发器/handler循环";
     return reason;
 }
 
 static std::string reason_to_en(const std::string &reason) {
+    if (reason == "embedded C++ ABI runtime range excluded from VMP candidates") return "Embedded C++ ABI/demangler runtime range excluded from VMP candidates";
+    if (reason == "protection VM interpreter marker cluster") return "JavaVMP and interpreter-wrapper markers provide protection-VM evidence";
+    if (reason == "imports protected VMP provider symbols") return "Confirmed client of a VMP provider through DT_NEEDED and shared symbols";
+    if (reason == "loaded from assets path") return "Located under assets path, possibly released or loaded at runtime";
     if (reason == "missing .symtab / stripped") return "Symbol table stripped";
     if (reason == "found RWX PT_LOAD segment") return "Found RWX PT_LOAD segment";
+    if (reason == "entry point in writable segment") return "ELF entry point is in a writable segment";
     if (reason == "large high-entropy blob detected") return "Large high-entropy blob detected";
     if (reason == "tiny .text but large file") return "Small .text but large file";
+    if (reason == "large init_array entry count") return "Large .init_array entry count";
+    if (reason.rfind("known hook framework:", 0) == 0) return "Known Hook/Trampoline framework detected";
+    if (reason.rfind("known runtime framework:", 0) == 0) return "Known third-party runtime/framework detected";
+    if (reason == "vmp-like branches explained by hook framework") return "VMP-like branches explained by Hook/Trampoline framework; not treated as VMP";
+    if (reason == "vmp-like branches explained by known runtime framework") return "VMP-like branches explained by known runtime/framework; not treated as VMP";
+    if (reason == "vmp metadata marker present") return "VMP metadata marker present";
+    if (reason == "custom linker with vmp-like dispatcher") return "Custom Linker sample contains VMP-like dispatcher windows";
+    if (reason == "custom linker marker string") return "Custom Linker private marker string";
+    if (reason == "custom linker loader profile") return "Custom Linker/Loader protection profile";
+    if (reason == "custom linker-like loader profile") return "Partial Custom Linker/Loader signals";
+    if (reason == "ELF dynamic loader strings present") return "ELF dynamic loading/relocation strings present";
+    if (reason == "manual mmap/mprotect loader api cluster") return "Manual mapping/protection/dynamic resolution API cluster";
+    if (reason == "protected payload/container signal") return "Protected payload or container signal";
     if (reason == "very low printable string density") return "Very low printable string density";
     if (reason == "high executable segment entropy") return "High executable segment entropy";
     if (reason == "high branch density in AArch64 text") return "High branch density";
@@ -1339,11 +2173,15 @@ static std::string reason_to_en(const std::string &reason) {
     if (reason.rfind("suspicious loader imports hit=", 0) == 0) {
         return "Suspicious loader imports";
     }
+    if (reason == "vmp-like dispatch signals") return "VMP-like dispatch signals";
     if (reason == "possible vmp dispatcher/handler loop") return "Possible VMP dispatcher/handler loop";
     return reason;
 }
 
 static std::string build_summary_zh(const AnalysisResult &r) {
+    if (r.final_label == "VMP_PROTECTED_CLIENT") {
+        return "该 so 自身未被判定含 VMP dispatcher；但其 DT_NEEDED 明确依赖高置信 VMP 保护库，且导入符号与该保护库的定义导出相交，因此判定为受该 VMP 保护链路服务的客户端。";
+    }
     if (r.final_label == "ZIP_SO_CONTAINER") {
         return "该 so 文件在 APK 中并不是裸 ELF，而是一个 ZIP 容器，真实的 native 库可能位于其内层或运行时再释放。";
     }
@@ -1353,8 +2191,20 @@ static std::string build_summary_zh(const AnalysisResult &r) {
     if (r.is_zip_container && r.inner_elf_found) {
         return "该 so 在 APK 中是 ZIP 容器，已自动提取内层 ELF 进行分析，内层样本存在明显保护或混淆特征。";
     }
+    if (r.final_label == "POSSIBLE_CUSTOM_LINKER_VMP") {
+        return "该 so 同时存在自定义 Linker/Loader 加固和 VMP 元数据/分发特征，静态上看属于组合式 native 保护。";
+    }
+    if (r.final_label == "POSSIBLE_CUSTOM_LINKER") {
+        return "该 so 存在较明显的自定义 Linker/Loader 加固特征，可能包含手动 ELF 映射、重定位、解密装载或绕过系统 linker 的逻辑。";
+    }
+    if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
+        return "该 so 更像 Hook/Trampoline 框架或运行时修改组件，存在可疑跳转但当前不按 VMP 或加壳处理。";
+    }
     if (r.final_label == "POSSIBLE_PACKER") {
         return "该 so 存在较明显的壳或加载器特征，静态上看像是经过了解密装载或入口保护处理。";
+    }
+    if (r.final_label == "POSSIBLE_VMP_OR_STRONG_OBF") {
+        return "该 so 存在较明显的 VMP 或解释器式分发特征，建议作为高优先级样本进一步确认。";
     }
     if (r.final_label == "POSSIBLE_OLLVM_OR_STRONG_OBF") {
         return "该 so 存在较明显的强混淆特征，可能使用了 OLLVM、控制流平坦化或其他高强度保护。";
@@ -1378,6 +2228,9 @@ static std::string build_summary_zh(const AnalysisResult &r) {
 }
 
 static std::string build_summary_en(const AnalysisResult &r) {
+    if (r.final_label == "VMP_PROTECTED_CLIENT") {
+        return "This SO is not claimed to contain its own VMP dispatcher. Its DT_NEEDED entry points to a high-confidence VMP provider and its imports overlap that provider's defined exports, so it is classified as a client of the protected execution path.";
+    }
     if (r.final_label == "ZIP_SO_CONTAINER") {
         return "This SO entry is not a raw ELF but a ZIP container. The actual native library may be inside or released at runtime.";
     }
@@ -1387,8 +2240,20 @@ static std::string build_summary_en(const AnalysisResult &r) {
     if (r.is_zip_container && r.inner_elf_found) {
         return "This SO is a ZIP container in APK. Inner ELF extracted and analyzed. Inner sample shows significant protection or obfuscation.";
     }
+    if (r.final_label == "POSSIBLE_CUSTOM_LINKER_VMP") {
+        return "This SO shows both Custom Linker/Loader protection and VMP metadata/dispatch signals, indicating combined native protection.";
+    }
+    if (r.final_label == "POSSIBLE_CUSTOM_LINKER") {
+        return "This SO shows obvious Custom Linker/Loader protection signals, possibly including manual ELF mapping, relocation, decrypt-loading, or bypassing the system linker.";
+    }
+    if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
+        return "This SO looks like a Hook/Trampoline framework or runtime patching component. Suspicious jumps are present but it is not treated as VMP or packer.";
+    }
     if (r.final_label == "POSSIBLE_PACKER") {
         return "This SO shows obvious packer or loader characteristics, likely processed with decryption loading or entry protection.";
+    }
+    if (r.final_label == "POSSIBLE_VMP_OR_STRONG_OBF") {
+        return "This SO shows obvious VMP or interpreter-style dispatch characteristics and should be prioritized for manual confirmation.";
     }
     if (r.final_label == "POSSIBLE_OLLVM_OR_STRONG_OBF") {
         return "This SO shows significant obfuscation characteristics, possibly using OLLVM, control flow flattening or other strong protections.";
@@ -1412,6 +2277,18 @@ static std::string build_summary_en(const AnalysisResult &r) {
 }
 
 static std::string build_advice_zh(const AnalysisResult &r) {
+    if (r.final_label == "VMP_PROTECTED_CLIENT") {
+        return "建议从该客户端对共享符号的调用点入手，跨库跟踪到VMP provider；不要在客户端内盲找dispatcher。";
+    }
+    if (r.possible_custom_linker && r.vmp.possible) {
+        return "建议先沿自定义 linker 的映射/解密/重定位流程找到真实代码区，再定位 VMP 元数据、dispatcher、handler 表和间接跳转链路。";
+    }
+    if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
+        return "建议按 Hook/Trampoline 框架复核导出符号、入口和 inline hook 跳板，不作为 VMP 优先样本。";
+    }
+    if (r.possible_custom_linker) {
+        return "建议优先查看 mmap/mprotect/open/read/dlopen/dlsym 调用链、ELF Program Header/Dynamic 段解析、重定位处理和解密后的内存映射。";
+    }
     if (r.vmp.possible) {
         return "建议重点查看入口函数、dispatcher循环、handler表、字节码数据区及间接跳转链路。";
     }
@@ -1431,6 +2308,18 @@ static std::string build_advice_zh(const AnalysisResult &r) {
 }
 
 static std::string build_advice_en(const AnalysisResult &r) {
+    if (r.final_label == "VMP_PROTECTED_CLIENT") {
+        return "Recommended: start from the client's shared-symbol call sites and follow them into the VMP provider; do not assume a dispatcher exists inside the client.";
+    }
+    if (r.possible_custom_linker && r.vmp.possible) {
+        return "Recommended: follow the custom linker mapping/decryption/relocation flow to the real code region, then locate VMP metadata, dispatcher, handler tables and indirect jumps.";
+    }
+    if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
+        return "Recommended: review exported symbols, entries and inline-hook trampolines as a Hook/Trampoline framework, not as a VMP-priority sample.";
+    }
+    if (r.possible_custom_linker) {
+        return "Recommended: inspect mmap/mprotect/open/read/dlopen/dlsym call chains, ELF Program Header/Dynamic parsing, relocation handling, and decrypted memory mappings.";
+    }
     if (r.vmp.possible) {
         return "Recommended: focus on entry functions, dispatcher loops, handler tables, bytecode data sections and indirect jump chains.";
     }
@@ -1471,6 +2360,75 @@ struct SummaryStats {
     int inner_elf_extracted = 0;
 };
 
+static std::string vmp_judgment_zh(const VmpDeepResult& vmp) {
+    if (vmp.outcome == "VMP_PROTECTED_CLIENT") return "依赖高置信VMP保护库的客户端（自身未检出dispatcher）";
+    if (vmp.outcome == "LIKELY_VMP") return "疑似VMP保护";
+    if (vmp.outcome == "VM_LIKE_INTERPRETER") return "存在VM结构，更像合法解释器/运行时";
+    if (vmp.outcome == "SUSPICIOUS_VM_STRUCTURE") return "存在可疑VM结构，保护意图证据不足";
+    if (vmp.outcome == "INCONCLUSIVE_PACKED") return "打包/加密阻断静态观察，VMP不可判定";
+    if (vmp.outcome == "PARTIAL_ANALYSIS") return "扫描不完整，VMP不可判定";
+    if (vmp.outcome == "NO_EXECUTABLE_CODE") return "无可观察执行代码，VMP不可判定";
+    if (vmp.outcome == "ANALYSIS_ERROR") return "VMP分析失败";
+    if (vmp.outcome == "NO_VMP_EVIDENCE") return "覆盖范围内未见结构性VMP证据";
+    return "未完成VMP分析";
+}
+
+static std::string vmp_judgment_en(const VmpDeepResult& vmp) {
+    if (vmp.outcome == "VMP_PROTECTED_CLIENT") return "Client of a high-confidence VMP provider; no local dispatcher is claimed";
+    if (vmp.outcome == "LIKELY_VMP") return "Likely VMP protection";
+    if (vmp.outcome == "VM_LIKE_INTERPRETER") return "VM structure present; better explained by a legitimate runtime";
+    if (vmp.outcome == "SUSPICIOUS_VM_STRUCTURE") return "Suspicious VM structure; insufficient protection-intent evidence";
+    if (vmp.outcome == "INCONCLUSIVE_PACKED") return "Packing/encryption blocks observation; VMP is inconclusive";
+    if (vmp.outcome == "PARTIAL_ANALYSIS") return "Partial scan; VMP is inconclusive";
+    if (vmp.outcome == "NO_EXECUTABLE_CODE") return "No observable executable code; VMP is inconclusive";
+    if (vmp.outcome == "ANALYSIS_ERROR") return "VMP analysis failed";
+    if (vmp.outcome == "NO_VMP_EVIDENCE") return "No structural VMP evidence in the covered code";
+    return "VMP analysis was not completed";
+}
+
+static std::string vmp_confidence_zh(const std::string& value) {
+    if (value == "HIGH") return "高";
+    if (value == "MEDIUM") return "中";
+    if (value == "LOW") return "低";
+    return "未知";
+}
+
+static std::string vmp_profile_zh(const std::string& value) {
+    if (value == "DEPENDENCY_LINKED") return "跨SO依赖关联";
+    if (value == "REGISTER_DISPATCH") return "寄存器/表分发";
+    if (value == "DIRECT_THREADED") return "direct-threaded";
+    if (value == "CALL_THREADED") return "call-threaded";
+    if (value == "RETURN_THREADED") return "return-threaded";
+    if (value == "CONDITIONAL_DISPATCH") return "条件链分发";
+    if (value == "THREADED_TRAMPOLINE") return "线程化跳板/调用边";
+    if (value == "MIXED") return "混合分发";
+    return "未识别";
+}
+
+static std::string vmp_profile_en(const std::string& value) {
+    if (value == "DEPENDENCY_LINKED") return "Cross-SO dependency link";
+    if (value == "REGISTER_DISPATCH") return "Register/table dispatch";
+    if (value == "DIRECT_THREADED") return "Direct-threaded";
+    if (value == "CALL_THREADED") return "Call-threaded";
+    if (value == "RETURN_THREADED") return "Return-threaded";
+    if (value == "CONDITIONAL_DISPATCH") return "Conditional-chain dispatch";
+    if (value == "THREADED_TRAMPOLINE") return "Threaded trampoline/call edge";
+    if (value == "MIXED") return "Mixed dispatch";
+    return "Unidentified";
+}
+
+static std::string vmp_trait_zh(const std::string& value) {
+    if (value == "VPC_FETCH") return "VPC/VIP取指";
+    if (value == "VPC_ADVANCE") return "VPC/VIP推进";
+    if (value == "OPCODE_TO_TARGET_DATAFLOW") return "opcode到handler目标数据流";
+    if (value == "HANDLER_POINTER_FETCH") return "从VPC直接取handler指针";
+    if (value == "TARGET_TABLE_LOAD") return "handler目标表读取";
+    if (value == "BACK_EDGE") return "控制流回边";
+    if (value == "SHARED_VM_CONTEXT") return "共享VM上下文";
+    if (value == "COMPARE_CHAIN") return "条件比较链";
+    return value;
+}
+
 static std::string vmp_signal_to_en(const std::string &signal) {
     if (signal == "重复出现高置信度取字节码-推进VIP-br分发窗口") return "Repeated high-confidence bytecode fetch-advance VIP-br dispatch window";
     if (signal == "出现多处高置信度取字节码-br分发窗口") return "Multiple high-confidence bytecode fetch-br dispatch windows";
@@ -1486,7 +2444,263 @@ static std::string vmp_signal_to_en(const std::string &signal) {
     if (signal == "位运算/比较密度偏高") return "High bitwise operation/compare density";
     if (signal == "导入较少且存在早期初始化入口") return "Few imports with early initialization entries";
     if (signal == "blr占优，更像虚表/函数指针调用") return "BLR dominant, more like vtable/function pointer calls";
+    if (signal == "存在VMP元数据标记") return "VMP metadata marker present";
+    if (signal == "自定义Linker样本中存在VMP分发相似窗口") return "Custom Linker sample contains VMP-like dispatcher windows";
+    if (starts_with(signal, "发现去重后的强分发数据流候选=")) return "Deduplicated strong dispatch-dataflow candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "opcode到handler目标存在数据依赖候选=")) return "Opcode-to-handler target dataflow candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "多个独立候选共享VPC/VIP寄存器=")) return "Independent candidates sharing a VPC/VIP register=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "候选访问共享VM上下文=")) return "Candidates accessing shared VM context=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "候选控制流存在回边=")) return "Candidates with control-flow back edges=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "识别到call-threaded间接调用候选=")) return "Call-threaded indirect-call candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "识别到return-threaded候选=")) return "Return-threaded candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "识别到条件链分发候选=")) return "Conditional-chain dispatch candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "识别到线程化跳板候选=")) return "Threaded trampoline candidates=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "已隔离普通switch跳表替代解释=")) return "Excluded ordinary switch jump-table explanations=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "已隔离vtable/函数指针调用替代解释=")) return "Excluded vtable/function-pointer explanations=" + signal.substr(signal.find('=') + 1);
+    if (starts_with(signal, "存在合法解释器/运行时替代解释: ")) return "Legitimate interpreter/runtime alternative: " + signal.substr(signal.find(':') + 2);
+    if (signal == "存在保护型VMP元数据辅助证据") return "Protection-specific VMP metadata is present";
+    if (signal == "打包/加密降低静态可观测性") return "Packing/encryption reduces static observability";
     return signal;
+}
+
+static void print_vmp_json_cn(const AnalysisResult& r,
+                              const char* indent,
+                              const char* nl) {
+    const auto& v = r.vmp;
+    std::cout << indent << "\"VMP判断\": \"" << json_escape(vmp_judgment_zh(v)) << "\"," << nl;
+    std::cout << indent << "\"VMP状态码\": \"" << json_escape(v.outcome) << "\"," << nl;
+    std::cout << indent << "\"VMP置信度\": \"" << json_escape(vmp_confidence_zh(v.confidence)) << "\"," << nl;
+    std::cout << indent << "\"VMP类型\": \"" << json_escape(vmp_profile_zh(v.profile)) << "\"," << nl;
+    std::cout << indent << "\"VMP分数\": " << std::fixed << std::setprecision(4) << v.score << "," << nl;
+    std::cout << indent << "\"VM结构分数\": " << std::fixed << std::setprecision(4) << v.structure_score << "," << nl;
+    std::cout << indent << "\"保护意图分数\": " << std::fixed << std::setprecision(4) << v.protection_intent_score << "," << nl;
+    std::cout << indent << "\"替代解释扣分\": " << std::fixed << std::setprecision(4) << v.alternative_penalty << "," << nl;
+    std::cout << indent << "\"VMP扫描覆盖率\": " << std::fixed << std::setprecision(4) << v.coverage << "," << nl;
+    std::cout << indent << "\"VMP可观测\": " << (v.observable ? "true" : "false") << "," << nl;
+
+    std::cout << indent << "\"VMP扫描指标\": {"
+              << "\"可执行字节\":" << v.metrics.executable_bytes << ","
+              << "\"扫描字节\":" << v.metrics.scanned_bytes << ","
+              << "\"候选反汇编字节\":" << v.metrics.decoded_candidate_bytes << ","
+              << "\"原始间接转移\":" << v.metrics.raw_indirect_transfers << ","
+              << "\"已排除桩点\":" << v.metrics.excluded_thunk_sites << ","
+              << "\"去重候选\":" << v.metrics.unique_candidates << ","
+              << "\"强候选\":" << v.metrics.strong_candidates << ","
+              << "\"中候选\":" << v.metrics.medium_candidates << ","
+              << "\"共享VPC最大候选数\":" << v.metrics.dominant_vip_sites << ","
+              << "\"4KB最大聚类数\":" << v.metrics.max_cluster_sites << "}," << nl;
+
+    std::cout << indent << "\"VMP特征\": [";
+    for (size_t i = 0; i < v.signals.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << "\"" << json_escape(v.signals[i]) << "\"";
+    }
+    std::cout << "]," << nl;
+
+    std::cout << indent << "\"VMP候选点\": [" << nl;
+    for (size_t i = 0; i < v.candidates.size(); ++i) {
+        const auto& candidate = v.candidates[i];
+        std::cout << indent << "  {\"地址\":\"0x" << std::hex << candidate.address << std::dec
+                  << "\",\"区域\":\"" << json_escape(candidate.region)
+                  << "\",\"类型\":\"" << json_escape(candidate.kind)
+                  << "\",\"强度\":\"" << json_escape(candidate.strength)
+                  << "\",\"VPC寄存器\":\"" << json_escape(candidate.vip_reg)
+                  << "\",\"opcode寄存器\":\"" << json_escape(candidate.opcode_reg)
+                  << "\",\"target寄存器\":\"" << json_escape(candidate.target_reg)
+                  << "\",\"特征\":[";
+        for (size_t j = 0; j < candidate.traits.size(); ++j) {
+            if (j) std::cout << ",";
+            std::cout << "\"" << json_escape(vmp_trait_zh(candidate.traits[j])) << "\"";
+        }
+        std::cout << "]}";
+        if (i + 1 != v.candidates.size()) std::cout << ",";
+        std::cout << nl;
+    }
+    std::cout << indent << "]," << nl;
+    if (!v.alternative_explanation.empty()) {
+        std::cout << indent << "\"VMP替代解释\": \""
+                  << json_escape(v.alternative_explanation) << "\"," << nl;
+    }
+    if (!v.limitation.empty()) {
+        std::cout << indent << "\"VMP分析限制\": \""
+                  << json_escape(v.limitation) << "\"," << nl;
+    }
+}
+
+static std::vector<AddressRange> find_dynamic_plt_branch_ranges(
+        const std::vector<ExecutableRegionView>& regions,
+        const std::vector<uint64_t>& jump_slot_vas) {
+    std::vector<AddressRange> ranges;
+    if (jump_slot_vas.empty()) return ranges;
+
+    Arm64DisasmEngine engine;
+    if (!engine.init()) return ranges;
+
+    for (const auto& region : regions) {
+        if (!region.data || region.size < 16 ||
+            region.virtual_address > UINT64_MAX - region.size) continue;
+        for (size_t offset = 0; offset + 4 <= region.size; offset += 4) {
+            uint32_t word = 0;
+            std::memcpy(&word, region.data + offset, sizeof(word));
+            if (word != 0xd61f0220U) continue;  // br x17
+
+            const size_t window_begin = offset > 24 ? offset - 24 : 0;
+            const size_t window_size = offset + 4 - window_begin;
+            auto instructions = engine.disasm_aligned_resilient(
+                region.data + window_begin, window_size,
+                region.virtual_address + window_begin, 0);
+            if (instructions.empty()) continue;
+
+            size_t branch_index = instructions.size();
+            for (size_t i = 0; i < instructions.size(); ++i) {
+                const auto& ins = instructions[i];
+                if (ins.address == region.virtual_address + offset &&
+                    ins.mnemonic == "br" && ins.operand_count > 0 &&
+                    ins.operands[0].type == DisasmOperandType::Reg &&
+                    ins.operands[0].reg == "x17") {
+                    branch_index = i;
+                    break;
+                }
+            }
+            if (branch_index == instructions.size()) continue;
+
+            const DisasmInsn* pointer_load = nullptr;
+            const DisasmInsn* page_base = nullptr;
+            bool has_plt_add = false;
+            size_t load_index = instructions.size();
+            for (size_t i = branch_index; i > 0; --i) {
+                const auto& ins = instructions[i - 1];
+                if (ins.mnemonic != "ldr" || ins.operand_count < 2 ||
+                    ins.operands[0].type != DisasmOperandType::Reg ||
+                    ins.operands[0].reg != "x17") continue;
+                for (size_t op = 1; op < ins.operand_count; ++op) {
+                    if (ins.operands[op].type == DisasmOperandType::Mem &&
+                        ins.operands[op].mem_base == "x16") {
+                        pointer_load = &ins;
+                        load_index = i - 1;
+                        break;
+                    }
+                }
+                if (pointer_load) break;
+            }
+            if (!pointer_load) continue;
+
+            for (size_t i = load_index; i > 0; --i) {
+                const auto& ins = instructions[i - 1];
+                if (ins.mnemonic == "adrp" && ins.operand_count >= 2 &&
+                    ins.operands[0].type == DisasmOperandType::Reg &&
+                    ins.operands[0].reg == "x16" &&
+                    ins.operands[1].type == DisasmOperandType::Imm) {
+                    page_base = &ins;
+                    break;
+                }
+            }
+            for (size_t i = load_index + 1; i < branch_index; ++i) {
+                const auto& ins = instructions[i];
+                if (ins.mnemonic == "add" && ins.operand_count >= 2 &&
+                    ins.operands[0].type == DisasmOperandType::Reg &&
+                    ins.operands[1].type == DisasmOperandType::Reg &&
+                    ins.operands[0].reg == "x16" &&
+                    ins.operands[1].reg == "x16") {
+                    has_plt_add = true;
+                    break;
+                }
+            }
+            if (!page_base || !has_plt_add || page_base->operands[1].imm < 0) continue;
+
+            const DisasmOperand* memory = nullptr;
+            for (size_t op = 1; op < pointer_load->operand_count; ++op) {
+                if (pointer_load->operands[op].type == DisasmOperandType::Mem) {
+                    memory = &pointer_load->operands[op];
+                    break;
+                }
+            }
+            if (!memory || memory->mem_disp < 0) continue;
+            const uint64_t page = static_cast<uint64_t>(page_base->operands[1].imm);
+            const uint64_t displacement = static_cast<uint64_t>(memory->mem_disp);
+            if (page > UINT64_MAX - displacement) continue;
+            const uint64_t slot_va = page + displacement;
+            if (std::binary_search(jump_slot_vas.begin(), jump_slot_vas.end(), slot_va)) {
+                const uint64_t branch_va = region.virtual_address + offset;
+                ranges.push_back({branch_va, branch_va + 4});
+            }
+        }
+    }
+
+    std::sort(ranges.begin(), ranges.end(), [](const AddressRange& lhs,
+                                                const AddressRange& rhs) {
+        return lhs.begin < rhs.begin;
+    });
+    ranges.erase(std::unique(ranges.begin(), ranges.end(),
+        [](const AddressRange& lhs, const AddressRange& rhs) {
+            return lhs.begin == rhs.begin && lhs.end == rhs.end;
+        }), ranges.end());
+    return ranges;
+}
+
+static void print_vmp_json_en(const AnalysisResult& r,
+                              const char* indent,
+                              const char* nl) {
+    const auto& v = r.vmp;
+    std::cout << indent << "\"vmp_judgment\": \"" << json_escape(vmp_judgment_en(v)) << "\"," << nl;
+    std::cout << indent << "\"vmp_outcome\": \"" << json_escape(v.outcome) << "\"," << nl;
+    std::cout << indent << "\"vmp_confidence\": \"" << json_escape(v.confidence) << "\"," << nl;
+    std::cout << indent << "\"vmp_profile\": \"" << json_escape(v.profile) << "\"," << nl;
+    std::cout << indent << "\"vmp_profile_label\": \"" << json_escape(vmp_profile_en(v.profile)) << "\"," << nl;
+    std::cout << indent << "\"vmp_score\": " << std::fixed << std::setprecision(4) << v.score << "," << nl;
+    std::cout << indent << "\"vm_structure_score\": " << std::fixed << std::setprecision(4) << v.structure_score << "," << nl;
+    std::cout << indent << "\"protection_intent_score\": " << std::fixed << std::setprecision(4) << v.protection_intent_score << "," << nl;
+    std::cout << indent << "\"alternative_penalty\": " << std::fixed << std::setprecision(4) << v.alternative_penalty << "," << nl;
+    std::cout << indent << "\"vmp_scan_coverage\": " << std::fixed << std::setprecision(4) << v.coverage << "," << nl;
+    std::cout << indent << "\"vmp_observable\": " << (v.observable ? "true" : "false") << "," << nl;
+
+    std::cout << indent << "\"vmp_metrics\": {"
+              << "\"executable_bytes\":" << v.metrics.executable_bytes << ","
+              << "\"scanned_bytes\":" << v.metrics.scanned_bytes << ","
+              << "\"decoded_candidate_bytes\":" << v.metrics.decoded_candidate_bytes << ","
+              << "\"raw_indirect_transfers\":" << v.metrics.raw_indirect_transfers << ","
+              << "\"excluded_thunk_sites\":" << v.metrics.excluded_thunk_sites << ","
+              << "\"unique_candidates\":" << v.metrics.unique_candidates << ","
+              << "\"strong_candidates\":" << v.metrics.strong_candidates << ","
+              << "\"medium_candidates\":" << v.metrics.medium_candidates << ","
+              << "\"dominant_vip_sites\":" << v.metrics.dominant_vip_sites << ","
+              << "\"max_cluster_sites_4k\":" << v.metrics.max_cluster_sites << "}," << nl;
+
+    std::cout << indent << "\"vmp_features\": [";
+    for (size_t i = 0; i < v.signals.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << "\"" << json_escape(vmp_signal_to_en(v.signals[i])) << "\"";
+    }
+    std::cout << "]," << nl;
+
+    std::cout << indent << "\"vmp_candidates\": [" << nl;
+    for (size_t i = 0; i < v.candidates.size(); ++i) {
+        const auto& candidate = v.candidates[i];
+        std::cout << indent << "  {\"address\":\"0x" << std::hex << candidate.address << std::dec
+                  << "\",\"region\":\"" << json_escape(candidate.region)
+                  << "\",\"kind\":\"" << json_escape(candidate.kind)
+                  << "\",\"strength\":\"" << json_escape(candidate.strength)
+                  << "\",\"vpc_reg\":\"" << json_escape(candidate.vip_reg)
+                  << "\",\"opcode_reg\":\"" << json_escape(candidate.opcode_reg)
+                  << "\",\"target_reg\":\"" << json_escape(candidate.target_reg)
+                  << "\",\"traits\":[";
+        for (size_t j = 0; j < candidate.traits.size(); ++j) {
+            if (j) std::cout << ",";
+            std::cout << "\"" << json_escape(candidate.traits[j]) << "\"";
+        }
+        std::cout << "]}";
+        if (i + 1 != v.candidates.size()) std::cout << ",";
+        std::cout << nl;
+    }
+    std::cout << indent << "]," << nl;
+    if (!v.alternative_explanation.empty()) {
+        std::cout << indent << "\"vmp_alternative_explanation\": \""
+                  << json_escape(v.alternative_explanation) << "\"," << nl;
+    }
+    if (!v.limitation.empty()) {
+        std::cout << indent << "\"vmp_limitation\": \""
+                  << json_escape(v.limitation) << "\"," << nl;
+    }
 }
 
 static SummaryStats build_summary_stats_zh(const std::vector<AnalysisResult> &results) {
@@ -1521,15 +2735,119 @@ static SummaryStats build_summary_stats_en(const std::vector<AnalysisResult> &re
     return s;
 }
 
-static void print_all_results_json_cn(const std::vector<AnalysisResult> &results, bool pretty = true) {
+static std::string scan_diagnostic_message(const std::string& code, bool chinese) {
+    struct MessagePair { const char* en; const char* zh; };
+    static const std::map<std::string, MessagePair> messages = {
+        {"APK_FILE_SIZE_LIMIT", {"APK exceeds the scanner input-size limit.", "APK 超过扫描器允许的输入大小上限。"}},
+        {"APK_ZIP_METADATA_LIMIT", {"ZIP metadata allocation exceeded its hard limit.", "ZIP 元数据内存分配超过硬限制。"}},
+        {"APK_OPEN_FAILED", {"Input is not a readable, supported APK/ZIP archive.", "输入文件不是可读取且受支持的 APK/ZIP。"}},
+        {"APK_ENTRY_LIMIT", {"APK contains too many ZIP entries; no SO was extracted.", "APK 的 ZIP 总条目数过多，未解压任何 SO。"}},
+        {"ZIP_ENTRY_STAT_FAILED", {"A ZIP entry could not be inspected and was skipped.", "某个 ZIP 条目无法读取元数据，已跳过。"}},
+        {"SO_CANDIDATE_LIMIT", {"APK contains too many relevant ARM64/assets SO candidates; scan was rejected.", "APK 中待分析的 ARM64/assets SO 候选过多，扫描已拒绝。"}},
+        {"SO_EMPTY_ENTRY", {"Empty SO entry was skipped.", "空 SO 条目已跳过。"}},
+        {"SO_ENCRYPTED_ENTRY", {"Encrypted SO entry is unsupported and was skipped.", "加密 SO 条目不受支持，已跳过。"}},
+        {"SO_UNSUPPORTED_COMPRESSION", {"SO uses an unsupported ZIP compression method and was skipped.", "SO 使用不受支持的 ZIP 压缩方式，已跳过。"}},
+        {"SO_ENTRY_TOO_LARGE", {"SO declared size exceeds the per-entry limit and was not extracted.", "SO 声明大小超过单条目上限，未执行解压。"}},
+        {"SO_COMPRESSION_RATIO_LIMIT", {"SO has a suspicious compression ratio and was not extracted.", "SO 压缩比异常，疑似解压炸弹，未执行解压。"}},
+        {"SO_TOTAL_UNCOMPRESSED_LIMIT", {"Cumulative relevant-SO budget was exhausted; this entry was skipped.", "相关 SO 累计解压预算已耗尽，该条目已跳过。"}},
+        {"SO_ALLOCATION_FAILED", {"Memory allocation for the bounded SO buffer failed.", "受限 SO 缓冲区内存分配失败。"}},
+        {"SO_EXTRACT_FAILED", {"SO extraction failed validation and the entry was skipped.", "SO 解压或校验失败，该条目已跳过。"}},
+        {"SO_ANALYSIS_ALLOCATION_FAILED", {"SO analysis ran out of its available memory and was skipped safely.", "SO 分析内存不足，已安全跳过。"}},
+        {"SO_ANALYSIS_FAILED", {"SO analysis failed safely; other entries may still have been analyzed.", "SO 分析安全失败，其他条目仍可继续分析。"}},
+        {"SCANNER_MEMORY_LIMIT", {"Scanner memory allocation failed; the request was stopped safely.", "扫描器内存分配失败，请求已安全停止。"}},
+        {"SCANNER_INTERNAL_ERROR", {"Scanner hit an internal error and stopped safely.", "扫描器遇到内部错误，已安全停止。"}},
+        {"INNER_ZIP_METADATA_LIMIT", {"Nested ZIP metadata exceeded its allocation limit.", "内层 ZIP 元数据超过内存限制。"}},
+        {"INNER_ZIP_OPEN_FAILED", {"Nested ZIP container could not be parsed safely.", "内层 ZIP 容器无法安全解析。"}},
+        {"INNER_ZIP_ENTRY_LIMIT", {"Nested ZIP contains too many entries.", "内层 ZIP 条目数过多。"}},
+        {"INNER_ZIP_ENTRY_STAT_FAILED", {"A nested ZIP entry could not be inspected.", "某个内层 ZIP 条目无法读取元数据。"}},
+        {"INNER_ZIP_ENCRYPTED_ENTRY", {"Encrypted nested entry was skipped.", "加密的内层条目已跳过。"}},
+        {"INNER_ZIP_UNSUPPORTED_COMPRESSION", {"Nested entry uses unsupported compression and was skipped.", "内层条目使用不支持的压缩方式，已跳过。"}},
+        {"INNER_ZIP_ENTRY_TOO_LARGE", {"Nested entry exceeds the per-entry limit.", "内层条目超过单条目大小上限。"}},
+        {"INNER_ZIP_COMPRESSION_RATIO_LIMIT", {"Nested entry has a suspicious compression ratio.", "内层条目压缩比异常，疑似解压炸弹。"}},
+        {"INNER_ZIP_TOTAL_UNCOMPRESSED_LIMIT", {"Nested ZIP cumulative decompression budget was exhausted.", "内层 ZIP 累计解压预算已耗尽。"}},
+        {"INNER_ZIP_ALLOCATION_FAILED", {"Memory allocation for a nested entry failed.", "内层条目内存分配失败。"}},
+        {"INNER_ZIP_EXTRACT_FAILED", {"Nested entry extraction failed validation.", "内层条目解压或校验失败。"}},
+    };
+    const auto it = messages.find(code);
+    if (it == messages.end()) {
+        return chinese ? "扫描器已安全处理该异常。" : "The scanner handled this condition safely.";
+    }
+    return chinese ? it->second.zh : it->second.en;
+}
+
+static void print_scan_metadata_json(const ApkScanReport& report,
+                                     bool chinese,
+                                     const char* indent1,
+                                     const char* indent2,
+                                     const char* indent3,
+                                     const char* nl) {
+    using Limits = obfuscan::ApkScanLimits;
+    std::cout << indent1 << "\"scan_status\": \"" << json_escape(report.status)
+              << "\"," << nl;
+    std::cout << indent1 << "\"scan_limits\": {" << nl;
+    std::cout << indent2 << "\"max_apk_bytes\": " << Limits::kMaxApkBytes << "," << nl;
+    std::cout << indent2 << "\"max_zip_metadata_bytes\": " << Limits::kMaxZipMetadataBytes << "," << nl;
+    std::cout << indent2 << "\"max_zip_entries\": " << Limits::kMaxZipEntries << "," << nl;
+    std::cout << indent2 << "\"max_candidate_so_entries\": " << Limits::kMaxCandidateSoEntries << "," << nl;
+    std::cout << indent2 << "\"max_single_so_uncompressed_bytes\": " << Limits::kMaxSingleSoBytes << "," << nl;
+    std::cout << indent2 << "\"max_total_relevant_so_uncompressed_bytes\": " << Limits::kMaxTotalRelevantSoBytes << "," << nl;
+    std::cout << indent2 << "\"max_compression_ratio\": " << Limits::kMaxCompressionRatio << "," << nl;
+    std::cout << indent2 << "\"compression_ratio_floor_bytes\": " << Limits::kCompressionRatioFloorBytes << "," << nl;
+    std::cout << indent2 << "\"max_inner_zip_entries\": " << Limits::kMaxInnerZipEntries << "," << nl;
+    std::cout << indent2 << "\"max_total_inner_uncompressed_bytes\": " << Limits::kMaxTotalInnerEntryBytes << "," << nl;
+    std::cout << indent2 << "\"max_recorded_diagnostics\": " << Limits::kMaxRecordedDiagnostics << nl;
+    std::cout << indent1 << "}," << nl;
+
+    std::cout << indent1 << "\"scan_observed\": {" << nl;
+    std::cout << indent2 << "\"apk_file_bytes\": " << report.apk_file_bytes << "," << nl;
+    std::cout << indent2 << "\"archive_entry_count\": " << report.archive_entry_count << "," << nl;
+    std::cout << indent2 << "\"relevant_so_count\": " << report.relevant_so_count << "," << nl;
+    std::cout << indent2 << "\"analyzed_so_count\": " << report.analyzed_so_count << "," << nl;
+    std::cout << indent2 << "\"skipped_so_count\": " << report.skipped_so_count << "," << nl;
+    std::cout << indent2 << "\"declared_relevant_uncompressed_bytes\": "
+              << report.declared_relevant_uncompressed_bytes << "," << nl;
+    std::cout << indent2 << "\"accepted_relevant_uncompressed_bytes\": "
+              << report.accepted_relevant_uncompressed_bytes << "," << nl;
+    std::cout << indent2 << "\"zip_metadata_peak_bytes\": "
+              << report.zip_metadata_peak_bytes << "," << nl;
+    std::cout << indent2 << "\"suppressed_diagnostic_count\": "
+              << report.suppressed_diagnostic_count << nl;
+    std::cout << indent1 << "}," << nl;
+
+    std::cout << indent1 << "\"scan_diagnostics\": [" << nl;
+    for (size_t i = 0; i < report.diagnostics.size(); ++i) {
+        const auto& diagnostic = report.diagnostics[i];
+        std::cout << indent2 << "{" << nl;
+        std::cout << indent3 << "\"severity\": \"" << json_escape(diagnostic.severity) << "\"," << nl;
+        std::cout << indent3 << "\"code\": \"" << json_escape(diagnostic.code) << "\"," << nl;
+        std::cout << indent3 << "\"message\": \""
+                  << json_escape(scan_diagnostic_message(diagnostic.code, chinese)) << "\"," << nl;
+        std::cout << indent3 << "\"entry\": \"" << json_escape(diagnostic.entry) << "\"," << nl;
+        std::cout << indent3 << "\"entry_index\": ";
+        if (diagnostic.has_entry_index) std::cout << diagnostic.entry_index;
+        else std::cout << "null";
+        std::cout << "," << nl;
+        std::cout << indent3 << "\"compressed_bytes\": " << diagnostic.compressed_bytes << "," << nl;
+        std::cout << indent3 << "\"uncompressed_bytes\": " << diagnostic.uncompressed_bytes << "," << nl;
+        std::cout << indent3 << "\"detail\": \"" << json_escape(diagnostic.detail) << "\"" << nl;
+        std::cout << indent2 << "}";
+        if (i + 1 != report.diagnostics.size()) std::cout << ",";
+        std::cout << nl;
+    }
+    std::cout << indent1 << "]," << nl;
+}
+
+static void print_all_results_json_cn(const ApkScanReport &report, bool pretty = true) {
     const char *indent1 = pretty ? "  " : "";
     const char *indent2 = pretty ? "    " : "";
     const char *indent3 = pretty ? "      " : "";
     const char *nl = pretty ? "\n" : "";
 
+    const auto& results = report.results;
     SummaryStats stats = build_summary_stats_zh(results);
 
     std::cout << "{" << nl;
+    print_scan_metadata_json(report, true, indent1, indent2, indent3, nl);
 
     std::cout << indent1 << "\"汇总\": {" << nl;
     std::cout << indent2 << "\"总so数量\": " << stats.total << "," << nl;
@@ -1582,25 +2900,44 @@ static void print_all_results_json_cn(const std::vector<AnalysisResult> &results
             std::cout << indent3 << "]," << nl;
         }
 
-        if (r.vmp.analyzed && risk_level_zh(r) == "高") {
-            std::cout << indent3 << "\"VMP判断\": \""
-                      << json_escape(r.vmp.possible ? "疑似VMP保护" : "未见明显VMP特征")
+        if (r.custom_linker_score >= 0.50 || r.possible_custom_linker) {
+            std::cout << indent3 << "\"自定义Linker判断\": \""
+                      << json_escape(r.possible_custom_linker ? "疑似自定义Linker加固" : "存在部分自定义Linker特征")
                       << "\"," << nl;
-
-            std::cout << indent3 << "\"VMP分数\": "
-                      << std::fixed << std::setprecision(4) << r.vmp.score << "," << nl;
-
-            if (r.vmp.possible) {
-                std::cout << indent3 << "\"VMP特征\": [" << nl;
-                for (size_t t = 0; t < r.vmp.signals.size(); ++t) {
-                    std::cout << indent3 << "  \"" << json_escape(r.vmp.signals[t]) << "\"";
-                    if (t + 1 != r.vmp.signals.size()) std::cout << ",";
-                    std::cout << nl;
-                }
-                std::cout << indent3 << "]," << nl;
-            }
+            std::cout << indent3 << "\"自定义Linker分数\": "
+                      << std::fixed << std::setprecision(4) << r.custom_linker_score << "," << nl;
         }
 
+        if (r.runtime_evidence_classes > 0) {
+            std::cout << indent3 << "\"运行时替代解释\": {" << nl;
+            std::cout << indent3 << "  \"类型\": \"" << json_escape(r.known_runtime_name) << "\"," << nl;
+            std::cout << indent3 << "  \"独立证据类别数\": "
+                      << static_cast<unsigned>(r.runtime_evidence_classes) << "," << nl;
+            std::cout << indent3 << "  \"已确认\": "
+                      << (r.known_vm_runtime ? "true" : "false") << "," << nl;
+            std::cout << indent3 << "  \"身份字符串命中\": "
+                      << r.runtime_raw_identity_hits << "," << nl;
+            std::cout << indent3 << "  \"导入API命中\": "
+                      << r.runtime_import_api_hits << nl;
+            std::cout << indent3 << "}," << nl;
+        }
+
+        if (r.vmp_protected_client) {
+            std::cout << indent3 << "\"VMP关联证据\": {" << nl;
+            std::cout << indent3 << "  \"VMP提供库\": \""
+                      << json_escape(r.vmp_provider_so) << "\"," << nl;
+            std::cout << indent3 << "  \"DT_NEEDED\": \""
+                      << json_escape(r.vmp_needed_library) << "\"," << nl;
+            std::cout << indent3 << "  \"共享符号\": [";
+            for (size_t j = 0; j < r.vmp_shared_symbols.size(); ++j) {
+                if (j) std::cout << ",";
+                std::cout << "\"" << json_escape(r.vmp_shared_symbols[j]) << "\"";
+            }
+            std::cout << "]" << nl;
+            std::cout << indent3 << "}," << nl;
+        }
+
+        print_vmp_json_cn(r, indent3, nl);
         std::cout << indent3 << "\"建议\": \"" << json_escape(build_advice_zh(r)) << "\"" << nl;
         std::cout << indent2 << "}";
 
@@ -1611,15 +2948,17 @@ static void print_all_results_json_cn(const std::vector<AnalysisResult> &results
     std::cout << "}" << nl;
 }
 
-static void print_all_results_json_en(const std::vector<AnalysisResult> &results, bool pretty = true) {
+static void print_all_results_json_en(const ApkScanReport &report, bool pretty = true) {
     const char *indent1 = pretty ? "  " : "";
     const char *indent2 = pretty ? "    " : "";
     const char *indent3 = pretty ? "      " : "";
     const char *nl = pretty ? "\n" : "";
 
+    const auto& results = report.results;
     SummaryStats stats = build_summary_stats_en(results);
 
     std::cout << "{" << nl;
+    print_scan_metadata_json(report, false, indent1, indent2, indent3, nl);
 
     std::cout << indent1 << "\"summary\": {" << nl;
     std::cout << indent2 << "\"total_so_count\": " << stats.total << "," << nl;
@@ -1672,25 +3011,45 @@ static void print_all_results_json_en(const std::vector<AnalysisResult> &results
             std::cout << indent3 << "]," << nl;
         }
 
-        if (r.vmp.analyzed && risk_level_en(r) == "High") {
-            std::cout << indent3 << "\"vmp_judgment\": \""
-                      << json_escape(r.vmp.possible ? "Possible VMP protection" : "No obvious VMP features")
+        if (r.custom_linker_score >= 0.50 || r.possible_custom_linker) {
+            std::cout << indent3 << "\"custom_linker_judgment\": \""
+                      << json_escape(r.possible_custom_linker ? "Possible Custom Linker protection" : "Partial Custom Linker signals")
                       << "\"," << nl;
-
-            std::cout << indent3 << "\"vmp_score\": "
-                      << std::fixed << std::setprecision(4) << r.vmp.score << "," << nl;
-
-            if (r.vmp.possible) {
-                std::cout << indent3 << "\"vmp_features\": [" << nl;
-                for (size_t t = 0; t < r.vmp.signals.size(); ++t) {
-                    std::cout << indent3 << "  \"" << json_escape(vmp_signal_to_en(r.vmp.signals[t])) << "\"";
-                    if (t + 1 != r.vmp.signals.size()) std::cout << ",";
-                    std::cout << nl;
-                }
-                std::cout << indent3 << "]," << nl;
-            }
+            std::cout << indent3 << "\"custom_linker_score\": "
+                      << std::fixed << std::setprecision(4) << r.custom_linker_score << "," << nl;
         }
 
+        if (r.runtime_evidence_classes > 0) {
+            std::cout << indent3 << "\"runtime_alternative\": {" << nl;
+            std::cout << indent3 << "  \"family\": \""
+                      << json_escape(r.known_runtime_name) << "\"," << nl;
+            std::cout << indent3 << "  \"evidence_classes\": "
+                      << static_cast<unsigned>(r.runtime_evidence_classes) << "," << nl;
+            std::cout << indent3 << "  \"confirmed\": "
+                      << (r.known_vm_runtime ? "true" : "false") << "," << nl;
+            std::cout << indent3 << "  \"raw_identity_hits\": "
+                      << r.runtime_raw_identity_hits << "," << nl;
+            std::cout << indent3 << "  \"import_api_hits\": "
+                      << r.runtime_import_api_hits << nl;
+            std::cout << indent3 << "}," << nl;
+        }
+
+        if (r.vmp_protected_client) {
+            std::cout << indent3 << "\"vmp_provider_evidence\": {" << nl;
+            std::cout << indent3 << "  \"provider_so\": \""
+                      << json_escape(r.vmp_provider_so) << "\"," << nl;
+            std::cout << indent3 << "  \"needed_library\": \""
+                      << json_escape(r.vmp_needed_library) << "\"," << nl;
+            std::cout << indent3 << "  \"shared_symbols\": [";
+            for (size_t j = 0; j < r.vmp_shared_symbols.size(); ++j) {
+                if (j) std::cout << ",";
+                std::cout << "\"" << json_escape(r.vmp_shared_symbols[j]) << "\"";
+            }
+            std::cout << "]" << nl;
+            std::cout << indent3 << "}," << nl;
+        }
+
+        print_vmp_json_en(r, indent3, nl);
         std::cout << indent3 << "\"suggestion\": \"" << json_escape(build_advice_en(r)) << "\"" << nl;
         std::cout << indent2 << "}";
 
@@ -1712,15 +3071,11 @@ static int risk_rank(const AnalysisResult& r) {
     return 1;
 }
 
-static int risk_rank_en(const AnalysisResult& r) {
-    std::string level = risk_level_en(r);
-    if (level == "High") return 3;
-    if (level == "Medium") return 2;
-    return 1;
-}
-
 static double combined_score(const AnalysisResult& r) {
-    return r.packer_score * 1.2 +
+    return (r.vmp_protected_client ? 1.00 : 0.0) +
+           r.custom_linker_score * 1.35 +
+           (r.possible_custom_linker ? 0.20 : 0.0) +
+           r.packer_score * 1.2 +
            r.strong_obf_score * 1.0 +
            r.ollvm_score * 0.9 +
            r.vmp.score * 0.35 +
@@ -1748,47 +3103,78 @@ static void sort_results_by_risk(std::vector<AnalysisResult>& results) {
 
 int main(int argc, char *argv[]) {
     init_console_utf8();
+#ifdef _WIN32
+    (void)argc;
+#endif
 
-    std::string apk_path;
+    ApkInputPath apk_path;
     bool output_en = false;
 
+#ifdef _WIN32
+    int wide_argc = 0;
+    LPWSTR *wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (wide_argv) {
+        for (int i = 1; i < wide_argc; ++i) {
+            std::wstring arg = wide_argv[i];
+            if (arg == L"--en") {
+                output_en = true;
+            } else if (arg.empty() || arg[0] != L'-') {
+                apk_path.native = arg;
+            }
+        }
+        if (!apk_path.native.empty()) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, apk_path.native.c_str(),
+                                                  -1, nullptr, 0, nullptr, nullptr);
+            if (bytes > 1) {
+                apk_path.utf8.resize(static_cast<size_t>(bytes));
+                WideCharToMultiByte(CP_UTF8, 0, apk_path.native.c_str(), -1,
+                                    apk_path.utf8.data(), bytes, nullptr, nullptr);
+                apk_path.utf8.resize(static_cast<size_t>(bytes - 1));
+            }
+        }
+        LocalFree(wide_argv);
+    }
+#else
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--en") {
             output_en = true;
         } else if (arg.find("-") != 0) {
-            apk_path = arg;
+            apk_path.utf8 = arg;
         }
     }
+#endif
 
-    if (apk_path.empty()) {
+    if (apk_path.utf8.empty()) {
         print_usage(argv[0]);
         return 1;
     }
 
-    auto sos = load_arm64_sos_from_apk(apk_path);
-    if (sos.empty()) {
-        if (output_en) {
-            std::cerr << "[-] No lib/arm64-v8a/*.so found\n";
-        } else {
-            std::cerr << "[-] 没找到 lib/arm64-v8a/*.so\n";
-        }
-        return 2;
+    ApkScanReport report;
+    try {
+        report = analyze_arm64_sos_from_apk(apk_path);
+        sort_results_by_risk(report.results);
+    } catch (const std::bad_alloc&) {
+        report = ApkScanReport{};
+        report.status = "ERROR";
+        add_report_diagnostic(report, "error", "SCANNER_MEMORY_LIMIT", apk_path.utf8);
+    } catch (const std::exception& error) {
+        report = ApkScanReport{};
+        report.status = "ERROR";
+        add_report_diagnostic(report, "error", "SCANNER_INTERNAL_ERROR",
+                              apk_path.utf8, error.what());
+    } catch (...) {
+        report = ApkScanReport{};
+        report.status = "ERROR";
+        add_report_diagnostic(report, "error", "SCANNER_INTERNAL_ERROR",
+                              apk_path.utf8, "unknown exception");
     }
-
-    std::vector<AnalysisResult> results;
-    results.reserve(sos.size());
-
-    for (size_t i = 0; i < sos.size(); ++i) {
-        results.push_back(analyze_so(sos[i].name_in_apk, sos[i].data));
-    }
-
-    sort_results_by_risk(results);
+    report.analyzed_so_count = report.results.size();
     
     if (output_en) {
-        print_all_results_json_en(results, true);
+        print_all_results_json_en(report, true);
     } else {
-        print_all_results_json_cn(results, true);
+        print_all_results_json_cn(report, true);
     }
     return 0;
 }
