@@ -88,12 +88,14 @@ ObfuScan 不依赖单一特征签名，而是采用多因子启发式评分：
 | 段熵、可写入口、大块高熵数据 | 加密、压缩或自修改代码迹象 |
 | 分支、间接转移、算逻指令密度 | 控制流复杂度与代码膨胀信号 |
 | `.init_array`、导入/导出和动态依赖 | 异常初始化、loader 与跨 SO 关系 |
-| packer、OLLVM、自定义 linker 特征 | 保护语境与风险门控 |
+| 自定义 ELF Loader 能力轴与 Linker 加固闭环 | 区分组件能力与保护结论 |
 | VMP 结构和 ZIP 伪装 SO | 独立的结构判定与二次容器分析 |
 
-最终风险等级由 packer、OLLVM/强混淆、自定义 linker、VMP 状态等多条门控共同决定，不再把一个总分直接当概率或用单一阈值覆盖所有类型。
+`CUSTOM_LOADER_COMPONENT` 仅表示发现较完整的 ELF 装载能力，尚未证实用于加固；只有装载闭环同时具备受保护 payload、解密装载等独立证据时，才判为 `LIKELY_CUSTOM_LINKER_PROTECTION`。Hook/Trampoline 框架使用 `mmap`、`mprotect`、`dlsym` 或读取 ELF 元数据属于 ELF introspection，不等于自定义 Linker 加固。
 
-完整评分逻辑可参阅源码 `main.cpp` 中的 `analyze_so()` 函数，以及 `vmp_detector.cpp` 的 VMP 多轴判定。
+最终风险等级由 packer、OLLVM/强混淆、已证实的 Linker 加固、VMP 状态等多条门控共同决定，不再把一个总分直接当概率或用单一阈值覆盖所有类型。
+
+完整判定逻辑可参阅 `custom_linker_detector.cpp` 的 Loader/加固多轴门控、`main.cpp` 中的 `analyze_so()` 集成，以及 `vmp_detector.cpp` 的 VMP 多轴判定。
 
 ---
 
@@ -337,12 +339,14 @@ ObfuScan uses multi-factor heuristic scoring rather than relying on a single sig
 | Segment entropy, writable entry, large high-entropy data | Encryption, compression, or self-modifying-code signals |
 | Branch, indirect-transfer, and arithmetic/logic density | Control-flow complexity and code-bloat signals |
 | `.init_array`, imports/exports, and dynamic dependencies | Abnormal initialization, loader, and cross-SO relationships |
-| Packer, OLLVM, and custom-linker traits | Protection context and risk gates |
+| Custom ELF-loader capability axes and linker-protection closure | Separate component capability from protection conclusions |
 | VMP structure and ZIP-disguised SO | Independent structural classification and nested-container analysis |
 
-The final risk level is selected through separate packer, OLLVM/strong-obfuscation, custom-linker, and VMP gates. A single aggregate number is neither treated as a probability nor used as one universal threshold for every protection family.
+`CUSTOM_LOADER_COMPONENT` means that a reasonably complete ELF-loading capability was found, but does not establish protection. `LIKELY_CUSTOM_LINKER_PROTECTION` additionally requires independent evidence such as a protected payload or decrypt-and-load behavior. ELF introspection by Hook/Trampoline frameworks—including `mmap`, `mprotect`, `dlsym`, and ELF metadata access—is not custom-linker protection by itself.
 
-See `analyze_so()` in `main.cpp` and the multi-axis verdict logic in `vmp_detector.cpp`.
+The final risk level is selected through separate packer, OLLVM/strong-obfuscation, established linker-protection, and VMP gates. A single aggregate number is neither treated as a probability nor used as one universal threshold for every protection family.
+
+See the loader/protection gates in `custom_linker_detector.cpp`, their `analyze_so()` integration in `main.cpp`, and the multi-axis VMP verdict logic in `vmp_detector.cpp`.
 
 ---
 

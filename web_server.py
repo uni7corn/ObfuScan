@@ -781,6 +781,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         .libchecker-team { margin-left: 7px; color: var(--muted); font-size: 12px; }
         .libchecker-desc { margin-top: 7px; color: #9eb0c6; font-size: 12px; }
 
+        .custom-linker-info { --linker-tone: var(--amber); position: relative; margin-top: 16px; padding: 18px; overflow: hidden; border: 1px solid rgba(255, 202, 102, 0.24); border-radius: var(--radius-lg); background: linear-gradient(135deg, rgba(255, 202, 102, 0.085), rgba(88, 230, 255, 0.025)); }
+        .custom-linker-info.outcome-protection { --linker-tone: var(--red); border-color: rgba(255, 95, 126, 0.28); background: linear-gradient(135deg, rgba(255, 95, 126, 0.105), rgba(255, 202, 102, 0.025)); }
+        .custom-linker-info::after { content: "ELF"; position: absolute; right: -8px; top: -19px; color: color-mix(in srgb, var(--linker-tone) 7%, transparent); font-family: Consolas, monospace; font-size: 78px; font-weight: 900; line-height: 1; pointer-events: none; }
+        .custom-linker-headline { position: relative; z-index: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; color: #e4edf8; font-size: 15px; font-weight: 700; }
+        .custom-linker-outcome-code { display: inline-block; padding: 4px 9px; border: 1px solid color-mix(in srgb, var(--linker-tone) 34%, transparent); border-radius: 999px; color: var(--linker-tone); background: color-mix(in srgb, var(--linker-tone) 9%, transparent); font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; font-weight: 750; }
+        .custom-linker-metrics, .custom-linker-evidence-grid { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 8px; }
+        .custom-linker-metric, .custom-linker-evidence-item { min-width: 0; padding: 10px 12px; border: 1px solid rgba(142, 167, 200, 0.11); border-radius: 10px; color: #d7e3f2; background: rgba(4, 10, 19, 0.35); overflow-wrap: anywhere; }
+        .custom-linker-metric .detail-label, .custom-linker-evidence-item .detail-label { display: block; margin-bottom: 3px; }
+        .custom-linker-evidence { position: relative; z-index: 1; margin-top: 10px; border: 1px solid rgba(142, 167, 200, 0.12); border-radius: 11px; background: rgba(5, 11, 21, 0.38); }
+        .custom-linker-evidence > summary { padding: 11px 13px; color: var(--linker-tone); cursor: pointer; font-size: 12px; font-weight: 750; }
+        .custom-linker-evidence[open] > summary { border-bottom: 1px solid var(--line); }
+        .custom-linker-evidence-grid { padding: 10px; }
+
         .vmp-info { --vmp-tone: var(--violet); position: relative; margin-top: 16px; padding: 20px; overflow: hidden; border: 1px solid rgba(159, 140, 255, 0.22); border-radius: var(--radius-lg); background: linear-gradient(135deg, rgba(159, 140, 255, 0.09), rgba(88, 230, 255, 0.035)); }
         .vmp-info.outcome-likely { --vmp-tone: var(--red); border-color: rgba(255, 95, 126, 0.28); background: linear-gradient(135deg, rgba(255, 95, 126, 0.11), rgba(159, 140, 255, 0.035)); }
         .vmp-info.outcome-client { --vmp-tone: var(--violet); border-color: rgba(159, 140, 255, 0.3); background: linear-gradient(135deg, rgba(159, 140, 255, 0.12), rgba(88, 230, 255, 0.045)); }
@@ -965,6 +978,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 preview: '预览',
                 customLinkerJudgment: '自定义Linker判断',
                 customLinkerScore: '自定义Linker分数',
+                customLinkerOutcome: '状态码',
+                customLinkerConfidence: '置信度',
+                customLinkerLoaderScore: '装载器分数',
+                customLinkerProtectionScore: '加固分数',
+                customLinkerEvidence: '结构化证据',
+                customLinkerComponentJudgment: '自定义 ELF Loader 组件（未证实加固）',
+                customLinkerProtectionJudgment: '疑似自定义 Linker 加固',
                 vmpJudgment: 'VMP判断',
                 vmpOutcome: '状态码',
                 vmpConfidence: '置信度',
@@ -1061,6 +1081,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 preview: 'Preview',
                 customLinkerJudgment: 'Custom Linker Judgment',
                 customLinkerScore: 'Custom Linker Score',
+                customLinkerOutcome: 'Outcome',
+                customLinkerConfidence: 'Confidence',
+                customLinkerLoaderScore: 'Loader Score',
+                customLinkerProtectionScore: 'Protection Score',
+                customLinkerEvidence: 'Structured Evidence',
+                customLinkerComponentJudgment: 'Custom ELF Loader component (protection not established)',
+                customLinkerProtectionJudgment: 'Likely custom Linker protection',
                 vmpJudgment: 'VMP Judgment',
                 vmpOutcome: 'Outcome',
                 vmpConfidence: 'Confidence',
@@ -1131,6 +1158,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             return '';
         }
 
+        function firstMeaningfulValue() {
+            for (let i = 0; i < arguments.length; i++) {
+                const value = arguments[i];
+                if (value === undefined || value === null) continue;
+                if (typeof value === 'string' && value.trim() === '') continue;
+                return value;
+            }
+            return '';
+        }
+
         function escapeHtml(value) {
             const text = String(value === undefined || value === null ? '' : value);
             return text.replace(/[&<>"']/g, character => ({
@@ -1176,6 +1213,63 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         function renderVmpMetric(label, value) {
             return '<div class="vmp-metric"><span class="detail-label">' + escapeHtml(label) + '</span>' + displayValue(value) + '</div>';
+        }
+
+        function renderCustomLinkerMetric(label, value, isScore) {
+            if (value === undefined || value === null || value === '') return '';
+            const shownValue = isScore ? formatScore(value) : value;
+            return '<div class="custom-linker-metric"><span class="detail-label">' + escapeHtml(label) + '</span>' + displayValue(shownValue) + '</div>';
+        }
+
+        function formatEvidenceValue(value) {
+            if (Array.isArray(value)) {
+                if (value.length === 0) return '—';
+                const visible = value.slice(0, 16).map(entry => {
+                    if (entry && typeof entry === 'object') return JSON.stringify(entry);
+                    return String(entry);
+                });
+                if (value.length > visible.length) visible.push('… +' + (value.length - visible.length));
+                return visible.join(' · ');
+            }
+            if (value && typeof value === 'object') return JSON.stringify(value);
+            return value;
+        }
+
+        function flattenCustomLinkerEvidence(value, prefix, rows, depth) {
+            if (rows.length >= 24) return;
+            if (value && typeof value === 'object' && !Array.isArray(value) && depth < 2) {
+                const entries = Object.entries(value);
+                if (entries.length === 0) {
+                    if (prefix) rows.push([prefix, '—']);
+                    return;
+                }
+                entries.forEach(entry => {
+                    if (rows.length >= 24) return;
+                    const key = prefix ? prefix + ' / ' + entry[0] : entry[0];
+                    const nested = entry[1];
+                    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+                        flattenCustomLinkerEvidence(nested, key, rows, depth + 1);
+                    } else {
+                        rows.push([key, formatEvidenceValue(nested)]);
+                    }
+                });
+                return;
+            }
+            rows.push([prefix || 'evidence', formatEvidenceValue(value)]);
+        }
+
+        function renderCustomLinkerEvidence(label, evidence) {
+            if (evidence === undefined || evidence === null || evidence === '') return '';
+            const rows = [];
+            flattenCustomLinkerEvidence(evidence, '', rows, 0);
+            if (rows.length === 0) return '';
+            let html = '<details class="custom-linker-evidence"><summary>' + escapeHtml(label) + '</summary><div class="custom-linker-evidence-grid">';
+            rows.forEach(row => {
+                const key = String(row[0]).replace(/_/g, ' ');
+                html += '<div class="custom-linker-evidence-item"><span class="detail-label">' + escapeHtml(key) + '</span>' + displayValue(row[1]) + '</div>';
+            });
+            html += '</div></details>';
+            return html;
         }
 
         function renderEngineState() {
@@ -1436,10 +1530,45 @@ class RequestHandler(BaseHTTPRequestHandler):
                     resultsHtml += '</div>';
                 }
 
-                const linkerJudgment = firstValue(item['自定义Linker判断'], item['custom_linker_judgment']);
-                if (linkerJudgment !== '') {
-                    resultsHtml += '<div class="detail-item"><span class="detail-label">' + escapeHtml(t.customLinkerJudgment) + '</span><br>' + displayValue(linkerJudgment);
-                    resultsHtml += '<br><span class="detail-label">' + escapeHtml(t.customLinkerScore) + '</span> ' + displayValue(firstValue(item['自定义Linker分数'], item['custom_linker_score'])) + '</div>';
+                const rawLinkerOutcome = firstMeaningfulValue(item['自定义Linker状态码'], item['custom_linker_outcome']);
+                const linkerOutcome = String(rawLinkerOutcome || '').trim().toUpperCase();
+                const backendLinkerJudgment = firstMeaningfulValue(item['自定义Linker判断'], item['custom_linker_judgment']);
+                const actionableLinkerOutcomes = new Set(['CUSTOM_LOADER_COMPONENT', 'LIKELY_CUSTOM_LINKER_PROTECTION']);
+                // An explicit hook/inspection outcome always wins over a stale legacy judgment.
+                // In particular, Pine must never be presented as custom-Linker protection.
+                const isHookInspectionOnly = linkerOutcome === 'ELF_INSPECTION_OR_HOOK';
+                const showCustomLinker = !isHookInspectionOnly &&
+                    (actionableLinkerOutcomes.has(linkerOutcome) || backendLinkerJudgment !== '');
+                if (showCustomLinker) {
+                    const isLoaderComponent = linkerOutcome === 'CUSTOM_LOADER_COMPONENT';
+                    const isLikelyProtection = linkerOutcome === 'LIKELY_CUSTOM_LINKER_PROTECTION';
+                    const linkerJudgment = isLoaderComponent
+                        ? t.customLinkerComponentJudgment
+                        : (firstMeaningfulValue(backendLinkerJudgment, isLikelyProtection ? t.customLinkerProtectionJudgment : ''));
+                    const linkerConfidence = firstMeaningfulValue(item['自定义Linker置信度'], item['custom_linker_confidence']);
+                    const newLoaderScore = firstMeaningfulValue(item['自定义Linker装载器分数'], item['custom_linker_loader_score']);
+                    const legacyLinkerScore = firstMeaningfulValue(item['自定义Linker分数'], item['custom_linker_score']);
+                    const linkerLoaderScore = firstMeaningfulValue(newLoaderScore, legacyLinkerScore);
+                    const linkerProtectionScore = firstMeaningfulValue(item['自定义Linker加固分数'], item['custom_linker_protection_score']);
+                    const linkerEvidenceCodes = firstMeaningfulValue(item['自定义Linker证据'], item['custom_linker_evidence']);
+                    const linkerEvidenceCounts = firstMeaningfulValue(item['自定义Linker证据计数'], item['custom_linker_evidence_counts']);
+                    const linkerEvidence = linkerEvidenceCounts !== ''
+                        ? { codes: linkerEvidenceCodes, counts: linkerEvidenceCounts }
+                        : linkerEvidenceCodes;
+                    const loaderScoreLabel = newLoaderScore !== '' ? t.customLinkerLoaderScore : t.customLinkerScore;
+
+                    resultsHtml += '<div class="custom-linker-info' + (isLikelyProtection ? ' outcome-protection' : '') + '">';
+                    resultsHtml += '<div class="custom-linker-headline"><span class="detail-label">' + escapeHtml(t.customLinkerJudgment) + '</span>' + displayValue(linkerJudgment);
+                    if (linkerOutcome !== '') {
+                        resultsHtml += '<span class="custom-linker-outcome-code">' + escapeHtml(t.customLinkerOutcome) + ' · ' + displayValue(linkerOutcome) + '</span>';
+                    }
+                    resultsHtml += '</div><div class="custom-linker-metrics">';
+                    resultsHtml += renderCustomLinkerMetric(t.customLinkerConfidence, linkerConfidence, false);
+                    resultsHtml += renderCustomLinkerMetric(loaderScoreLabel, linkerLoaderScore, true);
+                    resultsHtml += renderCustomLinkerMetric(t.customLinkerProtectionScore, linkerProtectionScore, true);
+                    resultsHtml += '</div>';
+                    resultsHtml += renderCustomLinkerEvidence(t.customLinkerEvidence, linkerEvidence);
+                    resultsHtml += '</div>';
                 }
 
                 const rawVmpJudgment = firstValue(item['VMP判断'], item['vmp_judgment']);

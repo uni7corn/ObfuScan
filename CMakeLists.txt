@@ -36,6 +36,8 @@ endif()
 add_library(obfuscan_core STATIC
         apk_scan_limits.cpp
         apk_scan_limits.h
+        custom_linker_detector.cpp
+        custom_linker_detector.h
         disasm_arm64.cpp
         disasm_arm64.h
         elf_dynamic.cpp
@@ -115,6 +117,17 @@ if (BUILD_TESTING)
         target_compile_options(apk_scan_limits_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
     endif()
     add_test(NAME apk_scan_limits_tests COMMAND apk_scan_limits_tests)
+
+    add_executable(custom_linker_detector_tests
+            tests/custom_linker_detector_tests.cpp
+    )
+    target_link_libraries(custom_linker_detector_tests PRIVATE obfuscan_core)
+    if (MSVC)
+        target_compile_options(custom_linker_detector_tests PRIVATE /W4 /EHsc /utf-8)
+    else()
+        target_compile_options(custom_linker_detector_tests PRIVATE -Wall -Wextra -Wpedantic -O2)
+    endif()
+    add_test(NAME custom_linker_detector_tests COMMAND custom_linker_detector_tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)

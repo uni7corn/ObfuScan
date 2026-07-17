@@ -16,8 +16,17 @@ FIXTURES = (
         "label": "protected-positive",
         "filename": "app-release.apk",
         "sha256": "F2065478741B4142229AD69BA63B33F62ADB0158F0DC6B0CFC65F274B2C2D741",
-        "likely": {"liboutput64.so", "libflare.so"},
+        # VMP expectations are intentionally independent of Custom Linker
+        # evidence. liboutput64.so is asserted below as Linker protection, but
+        # its VM topology alone remains reviewable rather than LIKELY_VMP.
+        "likely": {"libflare.so"},
         "outcomes": {},
+        "custom_linker": {
+            "exact": {
+                "lib/arm64-v8a/liboutput64.so":
+                    "LIKELY_CUSTOM_LINKER_PROTECTION",
+            },
+        },
     },
     {
         "label": "large-mixed-corpus",
@@ -31,17 +40,54 @@ FIXTURES = (
             "libunicorn.so": "VM_LIKE_INTERPRETER",
             "libtaobaoplayer.so": "SUSPICIOUS_VM_STRUCTURE",
         },
+        "custom_linker": {
+            "exact": {
+                "lib/arm64-v8a/liblibloaderuc.so":
+                    "CUSTOM_LOADER_COMPONENT",
+                "lib/arm64-v8a/libjsi.so":
+                    "CUSTOM_LOADER_COMPONENT",
+            },
+            "not_protection": (
+                "lib/arm64-v8a/libsqlite3.so",
+                "lib/arm64-v8a/libunicorn.so",
+                "lib/arm64-v8a/libquickjs.so",
+                "lib/arm64-v8a/libc++_shared.so",
+            ),
+        },
     },
     {
         "label": "unicode-path",
         "filename": None,
         "sha256": "27C9C93BCF9154D1E072A079F08A8BA67B0E1FCA41A4526066B85E91566C776F",
-        "likely": {"libflare.so", "libyaqcore_gdtadv.so"},
+        # This libflare build previously crossed the VMP gate only through the
+        # generic "linker" marker.  Removing that contaminated intent is the
+        # expected conservative result of the Custom Linker refactor.
+        "likely": {"libyaqcore_gdtadv.so"},
         "outcomes": {},
+        "custom_linker": {
+            "exact": {
+                "lib/arm64-v8a/libpine.so": "ELF_INSPECTION_OR_HOOK",
+            },
+            "detection_results": {
+                "lib/arm64-v8a/libpine.so": "Hook/Trampoline Framework",
+            },
+            "without_judgment": (
+                "lib/arm64-v8a/libpine.so",
+            ),
+            "vmp_outcomes": {
+                "lib/arm64-v8a/libpine.so": "NO_VMP_EVIDENCE",
+            },
+            "not_protection": (
+                "lib/arm64-v8a/libsentry.so",
+                "lib/arm64-v8a/libjsi.so",
+                "lib/arm64-v8a/libreactnativejni.so",
+                "lib/arm64-v8a/libhermes.so",
+            ),
+        },
     },
 )
 
-
+CUSTOM_LINKER_PROTECTION = "LIKELY_CUSTOM_LINKER_PROTECTION"
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -65,6 +111,72 @@ def so_basename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def normalized_so_path(value: str) -> str:
+    return value.replace("\\", "/")
+
+
+def check_custom_linker(
+    results_by_path: dict[str, dict],
+    fixture: dict,
+) -> list[str]:
+    expectations = fixture.get("custom_linker", {})
+    failures: list[str] = []
+    missing: set[str] = set()
+
+    def result_for(path: str) -> dict | None:
+        item = results_by_path.get(path)
+        if item is None and path not in missing:
+            missing.add(path)
+            failures.append(f"{path}: SO result missing")
+        return item
+
+    for path, expected in expectations.get("exact", {}).items():
+        item = result_for(path)
+        if item is None:
+            continue
+        actual = item.get("custom_linker_outcome")
+        if actual != expected:
+            failures.append(
+                f"{path}: expected custom_linker_outcome={expected}, got {actual}"
+            )
+
+    for path in expectations.get("not_protection", set()):
+        item = result_for(path)
+        if item is None:
+            continue
+        if "custom_linker_outcome" not in item:
+            failures.append(f"{path}: custom_linker_outcome missing")
+        elif item["custom_linker_outcome"] == CUSTOM_LINKER_PROTECTION:
+            failures.append(f"{path}: unexpected custom-linker protection verdict")
+
+    for path, expected in expectations.get("detection_results", {}).items():
+        item = result_for(path)
+        if item is None:
+            continue
+        actual = item.get("detection_result")
+        if actual != expected:
+            failures.append(
+                f"{path}: expected detection_result={expected}, got {actual}"
+            )
+
+    for path in expectations.get("without_judgment", set()):
+        item = result_for(path)
+        if item is not None and "custom_linker_judgment" in item:
+            failures.append(f"{path}: unexpected custom_linker_judgment")
+
+    for path, expected in expectations.get("vmp_outcomes", {}).items():
+        item = result_for(path)
+        if item is None:
+            continue
+        actual = item.get("vmp_outcome")
+        if actual != expected:
+            failures.append(
+                f"{path}: expected vmp_outcome={expected}, got {actual}"
+            )
+
+    return failures
+
+
 def run_fixture(scanner: Path, apk: Path, fixture: dict) -> list[str]:
     actual_hash = sha256(apk)
     if actual_hash != fixture["sha256"]:
@@ -85,6 +197,10 @@ def run_fixture(scanner: Path, apk: Path, fixture: dict) -> list[str]:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         return [f"invalid UTF-8 JSON: {error}"]
 
+    results_by_path = {
+        normalized_so_path(item.get("so_file", "")): item
+        for item in payload.get("results", [])
+    }
     results = {
         so_basename(item.get("so_file", "")): item
         for item in payload.get("results", [])
@@ -103,6 +219,7 @@ def run_fixture(scanner: Path, apk: Path, fixture: dict) -> list[str]:
         actual = results.get(name, {}).get("vmp_outcome")
         if actual != expected:
             failures.append(f"{name}: expected {expected}, got {actual}")
+    failures.extend(check_custom_linker(results_by_path, fixture))
     return failures
 
 

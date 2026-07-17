@@ -24,6 +24,7 @@
 
 #include "miniz.h"
 #include "apk_scan_limits.h"
+#include "custom_linker_detector.h"
 #include "disasm_arm64.h"
 #include "elf_dynamic.h"
 #include "vmp_detector.h"
@@ -610,6 +611,7 @@ struct AnalysisResult {
     size_t runtime_raw_identity_hits = 0;
     size_t runtime_import_api_hits = 0;
     bool possible_custom_linker = false;
+    obfuscan::custom_linker::Result custom_linker;
     std::string format_note;
     std::string known_framework_name;
     std::string known_runtime_name;
@@ -645,7 +647,6 @@ struct AnalysisResult {
     double packer_score = 0.0;
     double ollvm_score = 0.0;
     double strong_obf_score = 0.0;
-    double custom_linker_score = 0.0;
     bool vmp_protected_client = false;
     std::string vmp_provider_so;
     std::string vmp_needed_library;
@@ -713,7 +714,7 @@ static bool is_high_risk_result(const AnalysisResult& r) {
 
 static bool is_medium_risk_result(const AnalysisResult& r) {
     return r.known_hook_framework ||
-           r.custom_linker_score >= 0.50 ||
+           r.custom_linker.loader_component() ||
            r.packer_score >= 0.45 ||
            r.ollvm_score >= 0.50 ||
            r.strong_obf_score >= 0.50 ||
@@ -923,10 +924,8 @@ static AnalysisResult analyze_so(const std::string &name,
     if (is_known_runtime_library_name(so_basename, r.known_runtime_name)) {
         r.known_runtime_framework = true;
     }
-    if (so_basename.find("pine") != std::string::npos) {
-        r.known_hook_framework = true;
-        r.known_framework_name = "Pine";
-    }
+    const bool pine_basename_hint =
+        so_basename == "libpine.so" || so_basename == "libpinehook.so";
 
     std::vector<uint8_t> inner_work_buf;
     const std::vector<uint8_t>* work_buf_ptr = &input_buf;
@@ -1394,15 +1393,12 @@ static AnalysisResult analyze_so(const std::string &name,
         }
     }
 
+    // These are uncommon enough to support a generic packer suspicion. Common
+    // libc, mmap/mprotect, file-I/O and dlopen/dlsym imports are capabilities,
+    // not evidence that a library implements a private linker.
     static const std::unordered_set<std::string> suspicious_loader_imports = {
-        "dlopen", "android_dlopen_ext", "dlsym",
-        "mmap", "mprotect", "munmap",
-        "mremap", "memfd_create",
-        "memcpy", "memmove", "memset",
-        "pthread_create", "ptrace",
-        "prctl", "process_vm_readv", "process_vm_writev",
-        "open", "openat", "read", "pread64", "fstat", "lseek",
-        "syscall", "__system_property_get", "dl_iterate_phdr", "sigaction", "sigprocmask"
+        "android_dlopen_ext", "mremap", "memfd_create", "ptrace",
+        "process_vm_readv", "process_vm_writev", "dl_iterate_phdr"
     };
 
     size_t loader_hit = 0;
@@ -1411,13 +1407,11 @@ static AnalysisResult analyze_so(const std::string &name,
     }
 
     size_t pine_name_hits = count_buffer_needles_icase(work_buf, {
-        "_ZN4pine", "top.canyie.pine", "pine::", "PineEnhances", "PineConfig"
+        "_ZN4pine", "top.canyie.pine", "top/canyie/pine",
+        "PineNativeInlineHook", "pine::", "PineEnhances", "PineConfig"
     });
     size_t pine_art_hits = count_buffer_needles_icase(work_buf, {
         "ElfImage", "ArtMethod", "Jit", "RegisterNatives", "trampoline", "entrypoint"
-    });
-    size_t custom_linker_marker_hits = count_buffer_needles_icase(work_buf, {
-        "linker",  "customlinker", "shelllinker", "protectlinker"
     });
     size_t vmp_metadata_hits = count_buffer_needles_icase(work_buf, {
         "Target VMP2 metadata", "VMP2 metadata", "VMP metadata"
@@ -1429,7 +1423,10 @@ static AnalysisResult analyze_so(const std::string &name,
         ++vmp_metadata_hits;
         r.reasons.push_back("protection VM interpreter marker cluster");
     }
-    if (pine_name_hits >= 1 && pine_art_hits >= 1) {
+    const bool pine_identity_confirmed =
+        (pine_basename_hint && pine_name_hits >= 1 && pine_art_hits >= 1) ||
+        (pine_name_hits >= 2 && pine_art_hits >= 2);
+    if (pine_identity_confirmed) {
         r.known_hook_framework = true;
         r.known_framework_name = "Pine";
     }
@@ -1485,65 +1482,35 @@ static AnalysisResult analyze_so(const std::string &name,
     double zip_container_suspicion = r.is_zip_container ? 1.0 : 0.0;
     double asset_path_suspicion = loaded_from_assets ? 1.0 : 0.0;
 
-    size_t linker_elf_string_hits = count_buffer_needles_icase(work_buf, {
-        "PT_LOAD", "PT_DYNAMIC", "DT_NEEDED", "DT_INIT", "DT_INIT_ARRAY",
-        "DT_FINI", "DT_FINI_ARRAY", "DT_RELA", "DT_RELASZ", "DT_JMPREL",
-        "DT_PLTREL", "DT_SYMTAB", "DT_STRTAB", "DT_GNU_HASH", "DT_HASH",
-        "Elf64_Ehdr", "Elf64_Phdr", "Elf64_Dyn"
-    });
-    size_t linker_internal_hits = count_buffer_needles_icase(work_buf, {
-        "linker64", "/system/bin/linker", "/apex/com.android.runtime/bin/linker",
-        "soinfo", "solist", "android_namespace", "__loader_dlopen",
-        "call_constructors", "find_library", "link_image"
-    });
-    size_t map_import_hits = count_import_name_hits(r.imports, {
-        "mmap", "mprotect", "munmap", "mremap", "memfd_create"
-    });
-    size_t file_io_import_hits = count_import_name_hits(r.imports, {
-        "open", "openat", "read", "pread64", "lseek", "fstat", "close"
-    });
-    size_t dynlink_import_hits = count_import_name_hits(r.imports, {
-        "dlopen", "android_dlopen_ext", "dlsym", "dl_iterate_phdr"
-    });
-
     double suspicious_section_name = 0.0;
     static const std::vector<std::string> sec_needles = {
         "ollvm", "obf", "vmp", "vm", "protect", "guard", "shell", "stub"
     };
     if (contains_any_icase(section_names, sec_needles)) suspicious_section_name = 1.0;
 
-    bool linker_api_profile =
-        map_import_hits >= 2 &&
-        (file_io_import_hits >= 2 || dynlink_import_hits >= 2);
-    bool linker_parser_profile =
-        linker_elf_string_hits >= 3 || linker_internal_hits >= 1 || custom_linker_marker_hits >= 1;
-    bool protected_payload_profile =
-        huge_entropy_blob > 0.5 ||
-        tiny_text_big_file > 0.5 ||
-        low_string_density > 0.5 ||
-        r.entry_in_writable_segment ||
-        r.is_zip_container ||
-        loaded_from_assets;
+    obfuscan::custom_linker::Context custom_linker_context;
+    custom_linker_context.basename = so_basename;
+    custom_linker_context.known_hook_framework = r.known_hook_framework;
+    custom_linker_context.known_runtime_framework = r.known_runtime_framework;
+    custom_linker_context.sectionless = r.sections.empty();
+    custom_linker_context.code_obscured_by_packing =
+        (tiny_text_big_file > 0.5 && huge_entropy_blob > 0.5) ||
+        executable_regions.empty();
+    custom_linker_context.high_entropy_payload = huge_entropy_blob > 0.5;
+    custom_linker_context.packed_container = r.is_zip_container;
+    custom_linker_context.loaded_from_assets = loaded_from_assets;
 
-    r.custom_linker_score = clamp01(
-        std::min(0.40, custom_linker_marker_hits * 0.34) +
-        std::min(0.24, linker_elf_string_hits * 0.045) +
-        std::min(0.18, linker_internal_hits * 0.09) +
-        std::min(0.22, map_import_hits * 0.055) +
-        std::min(0.14, file_io_import_hits * 0.035) +
-        std::min(0.14, dynlink_import_hits * 0.045) +
-        (protected_payload_profile ? 0.10 : 0.0) +
-        (huge_entropy_blob > 0.5 ? 0.08 : 0.0) +
-        (tiny_text_big_file > 0.5 ? 0.06 : 0.0) +
-        (loaded_from_assets ? 0.05 : 0.0) +
-        (r.is_zip_container ? 0.05 : 0.0)
-    );
-
-    r.possible_custom_linker =
-        (r.custom_linker_score >= 0.62 &&
-         linker_api_profile &&
-         (linker_parser_profile || protected_payload_profile)) ||
-        (custom_linker_marker_hits >= 1 && linker_api_profile);
+    r.custom_linker = obfuscan::custom_linker::analyze(
+        work_buf, r.imports, custom_linker_context);
+    r.possible_custom_linker = r.custom_linker.likely_protection();
+    if (r.custom_linker.hook_alternative &&
+        r.custom_linker.outcome ==
+            obfuscan::custom_linker::Outcome::ELF_INSPECTION_OR_HOOK) {
+        r.known_hook_framework = true;
+        if (r.known_framework_name.empty()) {
+            r.known_framework_name = pine_basename_hint ? "Pine" : "Hook/Trampoline";
+        }
+    }
 
     r.packer_score =
         std::min(0.50, loader_hit * 0.08) +
@@ -1561,8 +1528,6 @@ static AnalysisResult analyze_so(const std::string &name,
     r.packer_score = clamp01(r.packer_score);
     if (r.possible_custom_linker) {
         r.packer_score = std::max(r.packer_score, 0.72);
-    } else if (r.custom_linker_score >= 0.50) {
-        r.packer_score = clamp01(r.packer_score + 0.08);
     }
 
     double branch_ratio = r.a64.branch_ratio();
@@ -1610,11 +1575,15 @@ static AnalysisResult analyze_so(const std::string &name,
     // genuine dispatcher merely because their filename is familiar.
     vmp_context.known_runtime = r.known_vm_runtime;
     vmp_context.known_non_vm_framework =
-        r.known_runtime_framework && !r.known_vm_runtime;
+        (r.known_runtime_framework && !r.known_vm_runtime) ||
+        r.known_hook_framework;
     vmp_context.runtime_evidence_classes = r.runtime_evidence_classes;
     vmp_context.known_runtime_name = r.known_runtime_name;
     vmp_context.vmp_metadata_marker = vmp_metadata_hits >= 1;
-    vmp_context.custom_linker_marker = custom_linker_marker_hits >= 1;
+    // VMP must not inherit intent from raw "linker" strings or generic
+    // loader APIs.  Only the independently gated protection verdict may act
+    // as supporting context, and it is counted once through the likely flag.
+    vmp_context.custom_linker_marker = false;
     vmp_context.custom_linker_likely = r.possible_custom_linker;
     vmp_context.control_flow_obfuscation_likely =
         obf_arith_ratio > 0.28 && r.avg_exec_entropy > 6.8 &&
@@ -1674,7 +1643,6 @@ static AnalysisResult analyze_so(const std::string &name,
         r.vmp.protection_intent_score < 0.50 &&
         !r.vmp.possible &&
         !r.possible_custom_linker &&
-        custom_linker_marker_hits == 0 &&
         !r.is_zip_container &&
         !r.rwx_segment &&
         !r.entry_in_writable_segment &&
@@ -1684,7 +1652,6 @@ static AnalysisResult analyze_so(const std::string &name,
         r.known_hook_framework &&
         !r.vmp.possible &&
         !r.possible_custom_linker &&
-        custom_linker_marker_hits == 0 &&
         !r.is_zip_container &&
         !r.rwx_segment &&
         !r.entry_in_writable_segment &&
@@ -1707,24 +1674,25 @@ static AnalysisResult analyze_so(const std::string &name,
     if (r.known_runtime_framework) {
         r.reasons.push_back("known runtime framework: " + r.known_runtime_name);
     }
-    bool report_linker_profile = r.possible_custom_linker || r.custom_linker_score >= 0.50;
-    if (custom_linker_marker_hits >= 1) {
-        r.reasons.push_back("custom linker marker string");
-    }
-    if (r.possible_custom_linker) {
-        r.reasons.push_back("custom linker loader profile");
-    } else if (r.custom_linker_score >= 0.50) {
-        r.reasons.push_back("custom linker-like loader profile");
-    }
-    if (report_linker_profile && linker_parser_profile) r.reasons.push_back("ELF dynamic loader strings present");
-    if (report_linker_profile && linker_api_profile) r.reasons.push_back("manual mmap/mprotect loader api cluster");
-    if (report_linker_profile && protected_payload_profile) {
-        r.reasons.push_back("protected payload/container signal");
+    if (r.custom_linker.likely_protection()) {
+        r.reasons.push_back("custom linker protection chain confirmed");
+        r.reasons.push_back("independent ELF loader stages confirmed");
+        r.reasons.push_back("protection-specific payload or identity evidence");
+    } else if (r.custom_linker.loader_component()) {
+        r.reasons.push_back("custom ELF loader component without protection proof");
+        r.reasons.push_back("independent ELF loader stages confirmed");
+    } else if (r.custom_linker.outcome ==
+                   obfuscan::custom_linker::Outcome::ELF_INSPECTION_OR_HOOK &&
+               r.custom_linker.hook_alternative) {
+        r.reasons.push_back("ELF inspection and memory patching explained by hook framework");
+    } else if (r.custom_linker.outcome ==
+               obfuscan::custom_linker::Outcome::INCONCLUSIVE_PACKED) {
+        r.reasons.push_back("custom linker analysis inconclusive because packing obscures code");
     }
     if (r.stripped) r.reasons.push_back("missing .symtab / stripped");
     if (r.rwx_segment) r.reasons.push_back("found RWX PT_LOAD segment");
     if (r.entry_in_writable_segment) r.reasons.push_back("entry point in writable segment");
-    if (loader_hit > 0) r.reasons.push_back("suspicious loader imports hit=" + std::to_string(loader_hit));
+    if (loader_hit > 0) r.reasons.push_back("runtime-sensitive imports hit=" + std::to_string(loader_hit));
     if (huge_entropy_blob > 0.5) r.reasons.push_back("large high-entropy blob detected");
     if (tiny_text_big_file > 0.5) r.reasons.push_back("tiny .text but large file");
     if (heavy_init_array > 0.5) r.reasons.push_back("large init_array entry count");
@@ -1740,6 +1708,8 @@ static AnalysisResult analyze_so(const std::string &name,
         r.final_label = "POSSIBLE_CUSTOM_LINKER";
     } else if (plain_known_hook) {
         r.final_label = "KNOWN_HOOK_FRAMEWORK";
+    } else if (r.custom_linker.loader_component()) {
+        r.final_label = "CUSTOM_LOADER_COMPONENT";
     } else if (r.packer_score >= 0.68 ||
         (r.packer_score >= 0.62 && r.strong_obf_score >= 0.58)) {
         r.final_label = "POSSIBLE_PACKER";
@@ -2059,6 +2029,7 @@ static std::string label_to_zh(const std::string &label) {
     if (label == "POSSIBLE_CUSTOM_LINKER_VMP") return "疑似自定义Linker+VMP加固";
     if (label == "POSSIBLE_CUSTOM_LINKER") return "疑似自定义Linker加固";
     if (label == "KNOWN_HOOK_FRAMEWORK") return "Hook/Trampoline框架";
+    if (label == "CUSTOM_LOADER_COMPONENT") return "自定义ELF Loader组件（未证实加固）";
     if (label == "POSSIBLE_PACKER") return "疑似加壳";
     if (label == "POSSIBLE_VMP_OR_STRONG_OBF") return "疑似 VMP/强混淆";
     if (label == "POSSIBLE_OLLVM_OR_STRONG_OBF") return "疑似强混淆/OLLVM";
@@ -2073,9 +2044,10 @@ static std::string label_to_zh(const std::string &label) {
 
 static std::string label_to_en(const std::string &label) {
     if (label == "VMP_PROTECTED_CLIENT") return "VMP-Protected Client";
-    if (label == "POSSIBLE_CUSTOM_LINKER_VMP") return "Possible Custom Linker + VMP Protection";
-    if (label == "POSSIBLE_CUSTOM_LINKER") return "Possible Custom Linker Packer";
+    if (label == "POSSIBLE_CUSTOM_LINKER_VMP") return "Likely Custom Linker + VMP Protection";
+    if (label == "POSSIBLE_CUSTOM_LINKER") return "Likely Custom Linker Protection";
     if (label == "KNOWN_HOOK_FRAMEWORK") return "Hook/Trampoline Framework";
+    if (label == "CUSTOM_LOADER_COMPONENT") return "Custom ELF Loader Component (Protection Not Established)";
     if (label == "POSSIBLE_PACKER") return "Possible Packer";
     if (label == "POSSIBLE_VMP_OR_STRONG_OBF") return "Possible VMP/Strong Obfuscation";
     if (label == "POSSIBLE_OLLVM_OR_STRONG_OBF") return "Possible OLLVM/Strong Obfuscation";
@@ -2117,12 +2089,12 @@ static std::string reason_to_zh(const std::string &reason) {
     if (reason == "vmp-like branches explained by known runtime framework") return "VMP相似跳转由常见运行时/框架解释，不按VMP处理";
     if (reason == "vmp metadata marker present") return "存在VMP元数据标记";
     if (reason == "custom linker with vmp-like dispatcher") return "自定义Linker样本中存在VMP分发相似窗口";
-    if (reason == "custom linker marker string") return "存在自定义Linker私有标记字符串";
-    if (reason == "custom linker loader profile") return "命中自定义Linker/Loader加固特征";
-    if (reason == "custom linker-like loader profile") return "存在部分自定义Linker/Loader特征";
-    if (reason == "ELF dynamic loader strings present") return "存在ELF动态装载/重定位相关字符串";
-    if (reason == "manual mmap/mprotect loader api cluster") return "存在手动映射/改权限/动态解析API组合";
-    if (reason == "protected payload/container signal") return "存在受保护payload或容器特征";
+    if (reason == "custom linker protection chain confirmed") return "自定义Linker装载链与加固证据均已通过门控";
+    if (reason == "custom ELF loader component without protection proof") return "检测到自定义ELF Loader组件，但没有足够的加固证据";
+    if (reason == "independent ELF loader stages confirmed") return "已确认ELF解析、重定位、依赖/符号解析等独立装载阶段";
+    if (reason == "protection-specific payload or identity evidence") return "存在加固专用payload或精确身份标记";
+    if (reason == "ELF inspection and memory patching explained by hook framework") return "ELF检查与内存修改行为可由Hook框架解释，不作为自定义Linker加固";
+    if (reason == "custom linker analysis inconclusive because packing obscures code") return "代码被打包隐藏，暂时无法确认自定义Linker";
     if (reason == "very low printable string density") return "可见字符串很少";
     if (reason == "high executable segment entropy") return "可执行段熵较高";
     if (reason == "high branch density in AArch64 text") return "分支跳转密度高";
@@ -2131,8 +2103,8 @@ static std::string reason_to_zh(const std::string &reason) {
     if (reason == "so entry is actually a zip container") return "该SO条目实际是ZIP容器";
     if (reason == "capstone init failed") return "Capstone 初始化失败";
 
-    if (reason.rfind("suspicious loader imports hit=", 0) == 0) {
-        return "存在较多可疑加载器导入函数";
+    if (reason.rfind("runtime-sensitive imports hit=", 0) == 0) {
+        return "存在运行时敏感导入函数";
     }
     if (reason == "vmp-like dispatch signals") return "存在一定 VMP 分发器相似特征";
     if (reason == "possible vmp dispatcher/handler loop") return "存在疑似VMP分发器/handler循环";
@@ -2156,12 +2128,12 @@ static std::string reason_to_en(const std::string &reason) {
     if (reason == "vmp-like branches explained by known runtime framework") return "VMP-like branches explained by known runtime/framework; not treated as VMP";
     if (reason == "vmp metadata marker present") return "VMP metadata marker present";
     if (reason == "custom linker with vmp-like dispatcher") return "Custom Linker sample contains VMP-like dispatcher windows";
-    if (reason == "custom linker marker string") return "Custom Linker private marker string";
-    if (reason == "custom linker loader profile") return "Custom Linker/Loader protection profile";
-    if (reason == "custom linker-like loader profile") return "Partial Custom Linker/Loader signals";
-    if (reason == "ELF dynamic loader strings present") return "ELF dynamic loading/relocation strings present";
-    if (reason == "manual mmap/mprotect loader api cluster") return "Manual mapping/protection/dynamic resolution API cluster";
-    if (reason == "protected payload/container signal") return "Protected payload or container signal";
+    if (reason == "custom linker protection chain confirmed") return "Custom Linker loader chain and protection evidence passed the gate";
+    if (reason == "custom ELF loader component without protection proof") return "Custom ELF loader component detected without sufficient protection evidence";
+    if (reason == "independent ELF loader stages confirmed") return "Independent ELF parsing, relocation, and dependency/symbol-resolution stages confirmed";
+    if (reason == "protection-specific payload or identity evidence") return "Protection-specific payload or precise identity evidence present";
+    if (reason == "ELF inspection and memory patching explained by hook framework") return "ELF inspection and memory patching are explained by the Hook framework, not Custom Linker protection";
+    if (reason == "custom linker analysis inconclusive because packing obscures code") return "Packing obscures the code; Custom Linker analysis is inconclusive";
     if (reason == "very low printable string density") return "Very low printable string density";
     if (reason == "high executable segment entropy") return "High executable segment entropy";
     if (reason == "high branch density in AArch64 text") return "High branch density";
@@ -2170,8 +2142,8 @@ static std::string reason_to_en(const std::string &reason) {
     if (reason == "so entry is actually a zip container") return "SO entry is actually a ZIP container";
     if (reason == "capstone init failed") return "Capstone initialization failed";
 
-    if (reason.rfind("suspicious loader imports hit=", 0) == 0) {
-        return "Suspicious loader imports";
+    if (reason.rfind("runtime-sensitive imports hit=", 0) == 0) {
+        return "Runtime-sensitive imports";
     }
     if (reason == "vmp-like dispatch signals") return "VMP-like dispatch signals";
     if (reason == "possible vmp dispatcher/handler loop") return "Possible VMP dispatcher/handler loop";
@@ -2199,6 +2171,9 @@ static std::string build_summary_zh(const AnalysisResult &r) {
     }
     if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
         return "该 so 更像 Hook/Trampoline 框架或运行时修改组件，存在可疑跳转但当前不按 VMP 或加壳处理。";
+    }
+    if (r.final_label == "CUSTOM_LOADER_COMPONENT") {
+        return "该 so 实现了较完整的自定义 ELF 装载链，包括解析、重定位及依赖/符号处理；但尚未发现足以证明加固的受保护 payload 或专用身份，因此只判为 Loader 组件。";
     }
     if (r.final_label == "POSSIBLE_PACKER") {
         return "该 so 存在较明显的壳或加载器特征，静态上看像是经过了解密装载或入口保护处理。";
@@ -2249,6 +2224,9 @@ static std::string build_summary_en(const AnalysisResult &r) {
     if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
         return "This SO looks like a Hook/Trampoline framework or runtime patching component. Suspicious jumps are present but it is not treated as VMP or packer.";
     }
+    if (r.final_label == "CUSTOM_LOADER_COMPONENT") {
+        return "This SO implements a substantial custom ELF loading chain, including parsing, relocation, and dependency/symbol handling, but no protected payload or protection-specific identity establishes hardening.";
+    }
     if (r.final_label == "POSSIBLE_PACKER") {
         return "This SO shows obvious packer or loader characteristics, likely processed with decryption loading or entry protection.";
     }
@@ -2286,6 +2264,9 @@ static std::string build_advice_zh(const AnalysisResult &r) {
     if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
         return "建议按 Hook/Trampoline 框架复核导出符号、入口和 inline hook 跳板，不作为 VMP 优先样本。";
     }
+    if (r.final_label == "CUSTOM_LOADER_COMPONENT") {
+        return "建议沿 ELF 解析、重定位和构造器调用链确认它服务于插件/运行时加载还是保护流程；在找到解密 payload 或明确保护关系前，不应直接按加固处理。";
+    }
     if (r.possible_custom_linker) {
         return "建议优先查看 mmap/mprotect/open/read/dlopen/dlsym 调用链、ELF Program Header/Dynamic 段解析、重定位处理和解密后的内存映射。";
     }
@@ -2316,6 +2297,9 @@ static std::string build_advice_en(const AnalysisResult &r) {
     }
     if (r.final_label == "KNOWN_HOOK_FRAMEWORK") {
         return "Recommended: review exported symbols, entries and inline-hook trampolines as a Hook/Trampoline framework, not as a VMP-priority sample.";
+    }
+    if (r.final_label == "CUSTOM_LOADER_COMPONENT") {
+        return "Recommended: trace ELF parsing, relocation, and constructor calls to determine whether this serves plugin/runtime loading or protection; do not call it hardening without decrypted payload or a precise protection relationship.";
     }
     if (r.possible_custom_linker) {
         return "Recommended: inspect mmap/mprotect/open/read/dlopen/dlsym call chains, ELF Program Header/Dynamic parsing, relocation handling, and decrypted memory mappings.";
@@ -2900,12 +2884,57 @@ static void print_all_results_json_cn(const ApkScanReport &report, bool pretty =
             std::cout << indent3 << "]," << nl;
         }
 
-        if (r.custom_linker_score >= 0.50 || r.possible_custom_linker) {
+        std::cout << indent3 << "\"自定义Linker状态码\": \""
+                  << obfuscan::custom_linker::outcome_code(r.custom_linker.outcome)
+                  << "\"," << nl;
+        std::cout << indent3 << "\"自定义Linker置信度\": \""
+                  << obfuscan::custom_linker::confidence_code(r.custom_linker.confidence)
+                  << "\"," << nl;
+        std::cout << indent3 << "\"自定义Linker装载器分数\": "
+                  << std::fixed << std::setprecision(4)
+                  << r.custom_linker.loader_score << "," << nl;
+        std::cout << indent3 << "\"自定义Linker加固分数\": "
+                  << std::fixed << std::setprecision(4)
+                  << r.custom_linker.protection_score << "," << nl;
+        std::cout << indent3 << "\"自定义Linker证据\": [";
+        for (size_t j = 0; j < r.custom_linker.evidence_codes.size(); ++j) {
+            if (j) std::cout << ",";
+            std::cout << "\"" << json_escape(r.custom_linker.evidence_codes[j]) << "\"";
+        }
+        std::cout << "]," << nl;
+        std::cout << indent3 << "\"自定义Linker证据计数\": {" << nl;
+        std::cout << indent3 << "  \"通用Linker噪声\": " << r.custom_linker.counts.generic_linker_noise_hits << "," << nl;
+        std::cout << indent3 << "  \"Hook身份\": " << r.custom_linker.counts.hook_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"Hook原语\": " << r.custom_linker.counts.hook_primitive_hits << "," << nl;
+        std::cout << indent3 << "  \"Loader精确身份\": " << r.custom_linker.counts.explicit_loader_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"加固精确身份\": " << r.custom_linker.counts.explicit_protection_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"受保护Payload身份\": " << r.custom_linker.counts.explicit_payload_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"ELF布局\": " << r.custom_linker.counts.elf_layout_hits << "," << nl;
+        std::cout << indent3 << "  \"重定位\": " << r.custom_linker.counts.relocation_hits << "," << nl;
+        std::cout << indent3 << "  \"依赖与符号解析\": " << r.custom_linker.counts.dependency_symbol_hits << "," << nl;
+        std::cout << indent3 << "  \"构造器\": " << r.custom_linker.counts.constructor_hits << "," << nl;
+        std::cout << indent3 << "  \"Linker内部语义\": " << r.custom_linker.counts.linker_internal_hits << "," << nl;
+        std::cout << indent3 << "  \"映射API\": " << r.custom_linker.counts.mapping_import_hits << "," << nl;
+        std::cout << indent3 << "  \"文件源API\": " << r.custom_linker.counts.file_source_import_hits << "," << nl;
+        std::cout << indent3 << "  \"动态链接API\": " << r.custom_linker.counts.dynamic_link_import_hits << "," << nl;
+        std::cout << indent3 << "  \"独立装载轴\": " << r.custom_linker.counts.independent_loader_axes << "," << nl;
+        std::cout << indent3 << "  \"加固轴\": " << r.custom_linker.counts.protection_axes << "," << nl;
+        std::cout << indent3 << "  \"Loader门控通过\": " << (r.custom_linker.loader_gate_passed ? "true" : "false") << "," << nl;
+        std::cout << indent3 << "  \"加固门控通过\": " << (r.custom_linker.protection_gate_passed ? "true" : "false") << nl;
+        std::cout << indent3 << "}," << nl;
+        if (r.custom_linker.loader_component()) {
             std::cout << indent3 << "\"自定义Linker判断\": \""
-                      << json_escape(r.possible_custom_linker ? "疑似自定义Linker加固" : "存在部分自定义Linker特征")
+                      << json_escape(r.possible_custom_linker
+                                         ? "疑似自定义Linker加固"
+                                         : "自定义ELF Loader组件（未证实加固）")
                       << "\"," << nl;
-            std::cout << indent3 << "\"自定义Linker分数\": "
-                      << std::fixed << std::setprecision(4) << r.custom_linker_score << "," << nl;
+            if (r.possible_custom_linker) {
+                // Legacy field: emit only for an actual protection verdict so
+                // old threshold-based clients cannot promote a Loader component.
+                std::cout << indent3 << "\"自定义Linker分数\": "
+                          << std::fixed << std::setprecision(4)
+                          << r.custom_linker.protection_score << "," << nl;
+            }
         }
 
         if (r.runtime_evidence_classes > 0) {
@@ -3011,12 +3040,57 @@ static void print_all_results_json_en(const ApkScanReport &report, bool pretty =
             std::cout << indent3 << "]," << nl;
         }
 
-        if (r.custom_linker_score >= 0.50 || r.possible_custom_linker) {
+        std::cout << indent3 << "\"custom_linker_outcome\": \""
+                  << obfuscan::custom_linker::outcome_code(r.custom_linker.outcome)
+                  << "\"," << nl;
+        std::cout << indent3 << "\"custom_linker_confidence\": \""
+                  << obfuscan::custom_linker::confidence_code(r.custom_linker.confidence)
+                  << "\"," << nl;
+        std::cout << indent3 << "\"custom_linker_loader_score\": "
+                  << std::fixed << std::setprecision(4)
+                  << r.custom_linker.loader_score << "," << nl;
+        std::cout << indent3 << "\"custom_linker_protection_score\": "
+                  << std::fixed << std::setprecision(4)
+                  << r.custom_linker.protection_score << "," << nl;
+        std::cout << indent3 << "\"custom_linker_evidence\": [";
+        for (size_t j = 0; j < r.custom_linker.evidence_codes.size(); ++j) {
+            if (j) std::cout << ",";
+            std::cout << "\"" << json_escape(r.custom_linker.evidence_codes[j]) << "\"";
+        }
+        std::cout << "]," << nl;
+        std::cout << indent3 << "\"custom_linker_evidence_counts\": {" << nl;
+        std::cout << indent3 << "  \"generic_linker_noise_hits\": " << r.custom_linker.counts.generic_linker_noise_hits << "," << nl;
+        std::cout << indent3 << "  \"hook_identity_hits\": " << r.custom_linker.counts.hook_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"hook_primitive_hits\": " << r.custom_linker.counts.hook_primitive_hits << "," << nl;
+        std::cout << indent3 << "  \"explicit_loader_identity_hits\": " << r.custom_linker.counts.explicit_loader_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"explicit_protection_identity_hits\": " << r.custom_linker.counts.explicit_protection_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"explicit_payload_identity_hits\": " << r.custom_linker.counts.explicit_payload_identity_hits << "," << nl;
+        std::cout << indent3 << "  \"elf_layout_hits\": " << r.custom_linker.counts.elf_layout_hits << "," << nl;
+        std::cout << indent3 << "  \"relocation_hits\": " << r.custom_linker.counts.relocation_hits << "," << nl;
+        std::cout << indent3 << "  \"dependency_symbol_hits\": " << r.custom_linker.counts.dependency_symbol_hits << "," << nl;
+        std::cout << indent3 << "  \"constructor_hits\": " << r.custom_linker.counts.constructor_hits << "," << nl;
+        std::cout << indent3 << "  \"linker_internal_hits\": " << r.custom_linker.counts.linker_internal_hits << "," << nl;
+        std::cout << indent3 << "  \"mapping_import_hits\": " << r.custom_linker.counts.mapping_import_hits << "," << nl;
+        std::cout << indent3 << "  \"file_source_import_hits\": " << r.custom_linker.counts.file_source_import_hits << "," << nl;
+        std::cout << indent3 << "  \"dynamic_link_import_hits\": " << r.custom_linker.counts.dynamic_link_import_hits << "," << nl;
+        std::cout << indent3 << "  \"independent_loader_axes\": " << r.custom_linker.counts.independent_loader_axes << "," << nl;
+        std::cout << indent3 << "  \"protection_axes\": " << r.custom_linker.counts.protection_axes << "," << nl;
+        std::cout << indent3 << "  \"loader_gate_passed\": " << (r.custom_linker.loader_gate_passed ? "true" : "false") << "," << nl;
+        std::cout << indent3 << "  \"protection_gate_passed\": " << (r.custom_linker.protection_gate_passed ? "true" : "false") << nl;
+        std::cout << indent3 << "}," << nl;
+        if (r.custom_linker.loader_component()) {
             std::cout << indent3 << "\"custom_linker_judgment\": \""
-                      << json_escape(r.possible_custom_linker ? "Possible Custom Linker protection" : "Partial Custom Linker signals")
+                      << json_escape(r.possible_custom_linker
+                                         ? "Likely Custom Linker protection"
+                                         : "Custom ELF loader component detected (protection not established)")
                       << "\"," << nl;
-            std::cout << indent3 << "\"custom_linker_score\": "
-                      << std::fixed << std::setprecision(4) << r.custom_linker_score << "," << nl;
+            if (r.possible_custom_linker) {
+                // Legacy field: emit only for an actual protection verdict so
+                // old threshold-based clients cannot promote a Loader component.
+                std::cout << indent3 << "\"custom_linker_score\": "
+                          << std::fixed << std::setprecision(4)
+                          << r.custom_linker.protection_score << "," << nl;
+            }
         }
 
         if (r.runtime_evidence_classes > 0) {
@@ -3073,8 +3147,10 @@ static int risk_rank(const AnalysisResult& r) {
 
 static double combined_score(const AnalysisResult& r) {
     return (r.vmp_protected_client ? 1.00 : 0.0) +
-           r.custom_linker_score * 1.35 +
-           (r.possible_custom_linker ? 0.20 : 0.0) +
+           (r.custom_linker.loader_component()
+                ? r.custom_linker.loader_score * 0.55
+                : 0.0) +
+           (r.possible_custom_linker ? 0.35 : 0.0) +
            r.packer_score * 1.2 +
            r.strong_obf_score * 1.0 +
            r.ollvm_score * 0.9 +
